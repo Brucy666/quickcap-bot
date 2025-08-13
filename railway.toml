@@ -1,0 +1,6 @@
+[build]
+builder = "DOCKERFILE"
+
+[env]
+PYTHONUNBUFFERED = "1"
+TZ = "UTC"
