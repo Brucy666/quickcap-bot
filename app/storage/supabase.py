@@ -1,4 +1,3 @@
-# app/storage/supabase.py
 import aiohttp
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
@@ -7,7 +6,6 @@ JSON = Dict[str, Any]
 
 class Supa:
     def __init__(self, url: str, key: str):
-        # url like https://xxxx.supabase.co ; we'll hit /rest/v1/<table>
         self.url = url.rstrip("/")
         self.key = key
 
@@ -23,27 +21,18 @@ class Supa:
         if not rows:
             return None
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.post(f"{self.url}/rest/v1/{table}", headers=self._headers(), json=rows, params={"select":"*"})
-            as r:
-                # swallow non-2xx gracefully
+            async with s.post(f"{self.url}/rest/v1/{table}", headers=self._headers(), json=rows, params={"select":"*"}) as r:
                 if r.status // 100 != 2:
-                    try:
-                        detail = await r.text()
-                    except Exception:
-                        detail = str(r.status)
-                    # don't raise—just return None to keep bot resilient
                     return None
                 try:
                     return await r.json()
                 except Exception:
                     return None
 
-    # -------- public helpers --------
     async def log_signal(
         self,
         *,
-        ts: Optional[str] = None,
-        signal_type: str,   # "spot" | "basis"
+        signal_type: str,  # "spot" | "basis"
         venue: str,
         symbol: str,
         interval: str,
@@ -57,7 +46,7 @@ class Supa:
         basis_z: Optional[float] = None,
     ):
         row: JSON = {
-            "ts": ts or datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "signal_type": signal_type,
             "venue": venue,
             "symbol": symbol,
@@ -76,7 +65,6 @@ class Supa:
     async def log_execution(
         self,
         *,
-        ts: Optional[str] = None,
         venue: str,
         symbol: str,
         side: str,
@@ -86,7 +74,7 @@ class Supa:
         is_paper: bool = True,
     ):
         row: JSON = {
-            "ts": ts or datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "venue": venue,
             "symbol": symbol,
             "side": side,
