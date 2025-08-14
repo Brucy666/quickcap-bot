@@ -1,3 +1,4 @@
+# app/storage/supabase.py
 import aiohttp, asyncio
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
@@ -7,12 +8,12 @@ JSON = Dict[str, Any]
 
 def _normalize_base(url: str) -> str:
     """
-    Accepts:
+    Acceptable inputs:
       https://xxx.supabase.co
       https://xxx.supabase.co/
       https://xxx.supabase.co/rest/v1
       https://xxx.supabase.co/%2Frest%2Fv1
-    Returns canonical: https://xxx.supabase.co
+    Returns canonical base: https://xxx.supabase.co
     """
     u = (url or "").strip().rstrip("/")
     u = u.replace("%2F", "/").replace("%2f", "/")
@@ -28,6 +29,7 @@ class Supa:
         self.base = _normalize_base(url)
         self.key = key
 
+    # ---------- low level ----------
     def _headers(self) -> dict:
         return {
             "apikey": self.key,
@@ -36,36 +38,78 @@ class Supa:
             "Prefer": "return=representation",
         }
 
-    async def _post(self, table: str, rows: List[JSON]) -> Optional[List[JSON]]:
+    async def _post(self, table: str, rows: List[JSON], params: Optional[dict] = None) -> Optional[List[JSON]]:
         if not rows:
             return None
         endpoint = f"{self.base}/rest/v1/{table}"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.post(endpoint, headers=self._headers(), json=rows, params={"select": "*"}) as r:
-                if r.status // 100 != 2:
-                    # swallow errors to keep the bot resilient
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
+                async with s.post(endpoint, headers=self._headers(), json=rows, params=params or {"select": "*"}) as r:
+                    # Swallow non-2xx without crashing the bot
+                    if r.status // 100 != 2:
+                        _ = await r.text()
+                        return None
                     try:
-                        await r.text()
+                        return await r.json()
                     except Exception:
-                        pass
-                    return None
-                try:
-                    return await r.json()
-                except Exception:
-                    return None
+                        return None
+        except Exception:
+            return None
 
-    # -------- fire‑and‑forget wrappers (do not block scan loop) --------
+    async def select(self, table: str, params: dict) -> List[JSON]:
+        """GET /rest/v1/<table>?<params>; returns [] on error."""
+        endpoint = f"{self.base}/rest/v1/{table}"
+        q = dict(params or {})
+        q.setdefault("select", "*")
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
+                async with s.get(endpoint, headers=self._headers(), params=q) as r:
+                    if r.status // 100 != 2:
+                        _ = await r.text()
+                        return []
+                    try:
+                        return await r.json()
+                    except Exception:
+                        return []
+        except Exception:
+            return []
+
+    async def insert(self, table: str, rows: List[JSON]) -> Optional[List[JSON]]:
+        """Simple INSERT; returns created rows or None on error."""
+        return await self._post(table, rows, params={"select": "*"})
+
+    async def upsert(self, table: str, rows: List[JSON], on_conflict: str) -> Optional[List[JSON]]:
+        """UPSERT using `on_conflict` columns, merge-duplicates preference."""
+        if not rows:
+            return None
+        endpoint = f"{self.base}/rest/v1/{table}"
+        params = {"on_conflict": on_conflict, "select": "*"}
+        headers = self._headers() | {"Prefer": "resolution=merge-duplicates,return=representation"}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
+                async with s.post(endpoint, headers=headers, params=params, json=rows) as r:
+                    if r.status // 100 != 2:
+                        _ = await r.text()
+                        return None
+                    try:
+                        return await r.json()
+                    except Exception:
+                        return None
+        except Exception:
+            return None
+
+    # ---------- fire-and-forget wrappers ----------
     def log_signal_bg(self, **kwargs) -> None:
         asyncio.create_task(self.log_signal(**kwargs))
 
     def log_execution_bg(self, **kwargs) -> None:
         asyncio.create_task(self.log_execution(**kwargs))
 
-    # -------- async writers --------
+    # ---------- domain writers ----------
     async def log_signal(
         self,
         *,
-        signal_type: str,   # "spot" | "basis"
+        signal_type: str,  # "spot" | "basis"
         venue: str,
         symbol: str,
         interval: str,
@@ -77,7 +121,7 @@ class Supa:
         triggers: List[str],
         basis_pct: Optional[float] = None,
         basis_z: Optional[float] = None,
-    ):
+    ) -> None:
         row: JSON = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "signal_type": signal_type,
@@ -93,7 +137,7 @@ class Supa:
             "basis_pct": basis_pct,
             "basis_z": basis_z,
         }
-        await self._post("signals", [row])
+        await self.insert("signals", [row])
 
     async def log_execution(
         self,
@@ -105,7 +149,7 @@ class Supa:
         score: float,
         reason: str,
         is_paper: bool = True,
-    ):
+    ) -> None:
         row: JSON = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "venue": venue,
@@ -116,4 +160,4 @@ class Supa:
             "reason": reason,
             "is_paper": is_paper,
         }
-        await self._post("executions", [row])
+        await self.insert("executions", [row])
