@@ -1,4 +1,4 @@
-# Silence warnings & set pandas options
+# Silence warnings & adopt pandas future behavior
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 import pandas as pd
@@ -16,8 +16,9 @@ from app.scoring import score_row
 from app.executor import PaperExecutor
 from app.notifier import post_signal_embed
 from app.alpha.spot_perp_engine import compute_basis_signals
+from app.storage.supabase import Supa
 
-# spot adapters
+# spot/perp adapters
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
     BinanceSpotPublic, OKXSpotPublic, BybitSpotPublic,
@@ -43,6 +44,11 @@ PERP_VENUES = {
 def _build_spot_exchanges(enabled: List[str]):
     return [(name, SPOT_ADAPTERS[name]()) for name in SPOT_ADAPTERS.keys() if name in enabled]
 
+def _supa(cfg):
+    if cfg.supabase_enabled and cfg.supabase_url and cfg.supabase_key:
+        return Supa(cfg.supabase_url, cfg.supabase_key)
+    return None
+
 async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
     try:
         kl = await ex.fetch_klines(symbol, interval, lookback)
@@ -50,18 +56,17 @@ async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
     except Exception:
         return to_dataframe([])
 
-async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExecutor):
+async def _process_symbol(cfg, supa, ex_name: str, ex, symbol: str, executor: PaperExecutor):
     df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
     if len(df) < 50:
         return
     sig = compute_signals(df)
     last = sig.iloc[-1].copy()
     last["score"] = float(score_row(last))
-
     if cfg.risk_off:
         return
 
-    triggers = []
+    triggers: list[str] = []
     if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
     if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
     if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
@@ -72,6 +77,14 @@ async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExe
             return
         LAST_ALERT[key] = now
         side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
+
+        if supa:
+            await supa.log_signal(
+                signal_type="spot", venue=ex_name, symbol=symbol, interval=cfg.interval, side=side,
+                price=float(last["close"]), vwap=float(last["vwap"]), rsi=float(last["rsi"]),
+                score=float(last["score"]), triggers=triggers,
+            )
+
         await post_signal_embed(
             cfg.discord_webhook,
             exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
@@ -80,7 +93,7 @@ async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExe
         )
         await executor.submit(symbol, side, float(last["close"]), float(last["score"]), ", ".join(triggers))
 
-async def _spot_perp_for_symbol(cfg, venue: str, symbol: str, executor):
+async def _spot_perp_for_symbol(cfg, supa, venue: str, symbol: str, executor):
     if venue not in PERP_VENUES:
         return
     spot_cls, perp_cls = PERP_VENUES[venue]
@@ -92,6 +105,15 @@ async def _spot_perp_for_symbol(cfg, venue: str, symbol: str, executor):
         return
     side = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
     score = 2.0 + min(abs(sig["basis_z"]), 5.0)
+
+    if supa:
+        await supa.log_signal(
+            signal_type="basis", venue=venue, symbol=symbol, interval=cfg.interval, side=side,
+            price=float(sig["spot_close"]), vwap=float(sig["spot_vwap"]), rsi=float(sig["spot_rsi"]),
+            score=float(score), triggers=list(sig["triggers"]),
+            basis_pct=float(sig["basis_pct"]), basis_z=float(sig["basis_z"]),
+        )
+
     await post_signal_embed(
         cfg.discord_webhook,
         exchange=f"{venue}:BASIS", symbol=symbol, interval=cfg.interval, side=side,
@@ -103,33 +125,32 @@ async def _spot_perp_for_symbol(cfg, venue: str, symbol: str, executor):
 
 async def scan_once():
     cfg = load_settings()
+    supa = _supa(cfg)
     executor = PaperExecutor(cfg.max_pos_usdt)
 
-    # Build per-venue hot symbols
+    # per-venue hot symbols
     if cfg.hotlist_enabled:
         hotmap = await build_hotmap(
             cfg.exchanges, top_n=cfg.hotlist_top_n,
             min_vol_usdt=cfg.hotlist_min_vol_usdt,
-            force_symbols=cfg.force_symbols,
-            exclude_symbols=cfg.exclude_symbols,
+            force_symbols=cfg.force_symbols, exclude_symbols=cfg.exclude_symbols,
         )
-        log.info(f"Hotlist per-venue: {{ " + ", ".join(f"{k}:{len(v)}" for k,v in hotmap.items()) + " }}")
+        log.info("Hotlist per-venue: { " + ", ".join(f"{k}:{len(v)}" for k, v in hotmap.items()) + " }")
     else:
-        # static fallback: same symbols for all enabled venues
         hotmap = {ex: list(cfg.symbols) for ex in cfg.exchanges}
 
-    # 1) Spot scans per-venue
+    # spot scans
     for ex_name, ex in _build_spot_exchanges(cfg.exchanges):
         symbols = hotmap.get(ex_name, []) or list(cfg.symbols)
         for sym in symbols:
-            await _process_symbol(cfg, ex_name, ex, sym, executor)
+            await _process_symbol(cfg, supa, ex_name, ex, sym, executor)
 
-    # 2) Spot↔Perp basis per-venue
+    # basis scans
     if cfg.spot_perp_enabled:
         for venue in cfg.spot_perp_exchanges:
             symbols = hotmap.get(venue, []) or list(cfg.symbols)
             for sym in symbols:
-                await _spot_perp_for_symbol(cfg, venue, sym, executor)
+                await _spot_perp_for_symbol(cfg, supa, venue, sym, executor)
 
 async def main_loop():
     cfg = load_settings()
