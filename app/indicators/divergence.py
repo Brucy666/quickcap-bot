@@ -1,10 +1,10 @@
 import pandas as pd
 
 def find_rsi_divergences(df: pd.DataFrame, swing: int = 3):
-    """Pivot-based RSI divergences with explicit boolean dtypes (no FutureWarnings)."""
     piv_high = (df["high"].shift(1) > df["high"].shift(swing)) & (df["high"].shift(1) > df["high"].shift(-swing))
     piv_low  = (df["low"].shift(1)  < df["low"].shift(swing))  & (df["low"].shift(1)  < df["low"].shift(-swing))
 
+    # Explicit boolean cast to silence FutureWarning
     df["_ph"] = piv_high.shift(-1).fillna(False).astype(bool)
     df["_pl"] = piv_low.shift(-1).fillna(False).astype(bool)
 
