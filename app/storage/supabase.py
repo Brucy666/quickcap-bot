@@ -1,12 +1,32 @@
-import aiohttp
+import aiohttp, asyncio
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 JSON = Dict[str, Any]
 
+def _normalize_base(url: str) -> str:
+    """
+    Accepts:
+      - https://xxx.supabase.co
+      - https://xxx.supabase.co/
+      - https://xxx.supabase.co/rest/v1
+      - https://xxx.supabase.co/%2Frest%2Fv1
+    Returns canonical: https://xxx.supabase.co
+    """
+    u = url.strip().rstrip("/")
+    u = u.replace("%2F", "/").replace("%2f", "/")  # de-encode slashes if user pasted encoded
+    if u.endswith("/rest/v1"):
+        u = u[:-len("/rest/v1")]
+    # sanity: must have scheme + netloc
+    parsed = urlparse(u)
+    if not (parsed.scheme and parsed.netloc):
+        raise ValueError(f"Invalid SUPABASE_URL: {url!r}")
+    return u
+
 class Supa:
     def __init__(self, url: str, key: str):
-        self.url = url.rstrip("/")
+        self.base = _normalize_base(url)
         self.key = key
 
     def _headers(self) -> dict:
@@ -17,17 +37,30 @@ class Supa:
             "Prefer": "return=representation",
         }
 
-    async def insert(self, table: str, rows: List[JSON]) -> Optional[List[JSON]]:
+    async def _post(self, table: str, rows: List[JSON]) -> Optional[List[JSON]]:
         if not rows:
             return None
+        endpoint = f"{self.base}/rest/v1/{table}"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.post(f"{self.url}/rest/v1/{table}", headers=self._headers(), json=rows, params={"select":"*"}) as r:
+            async with s.post(endpoint, headers=self._headers(), json=rows, params={"select":"*"}) as r:
                 if r.status // 100 != 2:
+                    # swallow but return None to keep bot healthy
+                    try:
+                        _ = await r.text()
+                    except Exception:
+                        pass
                     return None
                 try:
                     return await r.json()
                 except Exception:
                     return None
+
+    # ---- public, fire-and-forget wrappers ----
+    def log_signal_bg(self, **kwargs) -> None:
+        asyncio.create_task(self.log_signal(**kwargs))
+
+    def log_execution_bg(self, **kwargs) -> None:
+        asyncio.create_task(self.log_execution(**kwargs))
 
     async def log_signal(
         self,
@@ -60,7 +93,7 @@ class Supa:
             "basis_pct": basis_pct,
             "basis_z": basis_z,
         }
-        await self.insert("signals", [row])
+        await self._post("signals", [row])
 
     async def log_execution(
         self,
@@ -83,4 +116,4 @@ class Supa:
             "reason": reason,
             "is_paper": is_paper,
         }
-        await self.insert("executions", [row])
+        await self._post("executions", [row])
