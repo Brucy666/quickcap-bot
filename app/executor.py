@@ -9,22 +9,21 @@ class PaperExecutor:
         self.max_usdt = max_usdt
 
     async def submit(self, symbol: str, side: str, price: float, score: float, reason: str):
-        # Log to console
         log.info(f"[PAPER] {symbol} {side} @ {price:.4f} (score={score}) :: {reason}")
 
-        # Supabase logging
         try:
             cfg = load_settings()
             if cfg.supabase_enabled and cfg.supabase_url and cfg.supabase_key:
                 supa = Supa(cfg.supabase_url, cfg.supabase_key)
-                await supa.log_execution(
+                # background logging (non‑blocking)
+                supa.log_execution_bg(
                     venue="PAPER",
                     symbol=symbol,
                     side=side,
                     price=price,
                     score=score,
                     reason=reason,
-                    is_paper=True
+                    is_paper=True,
                 )
         except Exception as e:
             log.error(f"Supabase log_execution error: {e}")
