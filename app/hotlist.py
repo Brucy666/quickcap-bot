@@ -1,69 +1,54 @@
 import asyncio
-from typing import Iterable, Set, List
+from typing import Iterable, Dict, List
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
-    BybitSpotPublic, BinanceSpotPublic, OKXSpotPublic
+    BinanceSpotPublic, OKXSpotPublic, BybitSpotPublic,
 )
 
-async def _kucoin_hot(top_n: int, min_vol_usdt: float) -> List[str]:
+async def _safe(call):
     try:
-        return await KuCoinPublic.top_symbols(top_n=top_n, min_vol_usdt=min_vol_usdt)
+        return await call
     except Exception:
         return []
 
-async def _mexc_hot(top_n: int, min_vol_usdt: float) -> List[str]:
-    try:
-        return await MEXCPublic.top_symbols(top_n=top_n, min_vol_usdt=min_vol_usdt)
-    except Exception:
-        return []
-
-async def _bybit_hot(top_n: int, min_vol_usdt: float) -> List[str]:
-    try:
-        return await BybitSpotPublic.top_symbols(top_n=top_n, min_vol_usdt=min_vol_usdt)
-    except Exception:
-        return []
-
-async def _binance_hot(top_n: int, min_vol_usdt: float) -> List[str]:
-    try:
-        return await BinanceSpotPublic.top_symbols(top_n=top_n, min_vol_usdt=min_vol_usdt)
-    except Exception:
-        return []
-
-async def _okx_hot(top_n: int, min_vol_usdt: float) -> List[str]:
-    try:
-        return await OKXSpotPublic.top_symbols(top_n=top_n, min_vol_usdt=min_vol_usdt)
-    except Exception:
-        return []
-
-async def build_hotlist(
+async def build_hotmap(
     exchanges: Iterable[str],
     top_n: int = 20,
     min_vol_usdt: float = 0.0,
     force_symbols: Iterable[str] = (),
     exclude_symbols: Iterable[str] = (),
-) -> List[str]:
+) -> Dict[str, List[str]]:
     """
-    Build a deduped symbol list by pulling top movers/volume from enabled venues.
-    Returns up to top_n unique symbols (plus forced), excluding any in exclude_symbols.
+    Returns per-venue hot symbols: { 'kucoin': [...], 'binance': [...], ... }
+    Symbols are venue-native and already tradable on that venue.
     """
     ex = {x.strip().lower() for x in exchanges if x.strip()}
-    tasks = []
-    if "kucoin" in ex:  tasks.append(_kucoin_hot(top_n, min_vol_usdt))
-    if "mexc" in ex:    tasks.append(_mexc_hot(top_n, min_vol_usdt))
-    if "bybit" in ex:   tasks.append(_bybit_hot(top_n, min_vol_usdt))
-    if "binance" in ex: tasks.append(_binance_hot(top_n, min_vol_usdt))
-    if "okx" in ex:     tasks.append(_okx_hot(top_n, min_vol_usdt))
+    tasks = {}
+    if "kucoin" in ex:  tasks["kucoin"]  = _safe(KuCoinPublic.top_symbols(top_n, min_vol_usdt))
+    if "mexc" in ex:    tasks["mexc"]    = _safe(MEXCPublic.top_symbols(top_n, min_vol_usdt))
+    if "binance" in ex: tasks["binance"] = _safe(BinanceSpotPublic.top_symbols(top_n, min_vol_usdt))
+    if "okx" in ex:     tasks["okx"]     = _safe(OKXSpotPublic.top_symbols(top_n, min_vol_usdt))
+    if "bybit" in ex:   tasks["bybit"]   = _safe(BybitSpotPublic.top_symbols(top_n, min_vol_usdt))
 
-    out: Set[str] = set()
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, Exception):
-                continue
-            out.update(res)
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    hot: Dict[str, List[str]] = {}
+    for k, res in zip(tasks.keys(), results):
+        syms = [] if isinstance(res, Exception) else list(dict.fromkeys(res))  # uniq + keep order
+        hot[k] = syms
 
-    out.update([s.strip() for s in force_symbols if s and s.strip()])
-    out.difference_update([s.strip() for s in exclude_symbols if s and s.strip()])
+    # apply excludes per-venue; add force symbols if they exist on the venue (BTC/ETH safe everywhere)
+    excludes = {s.strip() for s in exclude_symbols if s and s.strip()}
+    forced   = [s.strip() for s in force_symbols if s and s.strip()]
+    for venue, syms in hot.items():
+        syms = [s for s in syms if s not in excludes]
+        # ensure forced symbols appear first if present on the venue (BTC/ETH are universal)
+        for f in forced:
+            if f in syms:
+                syms.remove(f)
+                syms.insert(0, f)
+            else:
+                # if not present, keep as-is (do not inject to avoid invalid-symbol errors)
+                pass
+        hot[venue] = syms[:top_n]
 
-    # Stable, trimmed list
-    return sorted(out)[: top_n]
+    return hot
