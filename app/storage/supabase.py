@@ -8,17 +8,16 @@ JSON = Dict[str, Any]
 def _normalize_base(url: str) -> str:
     """
     Accepts:
-      - https://xxx.supabase.co
-      - https://xxx.supabase.co/
-      - https://xxx.supabase.co/rest/v1
-      - https://xxx.supabase.co/%2Frest%2Fv1
+      https://xxx.supabase.co
+      https://xxx.supabase.co/
+      https://xxx.supabase.co/rest/v1
+      https://xxx.supabase.co/%2Frest%2Fv1
     Returns canonical: https://xxx.supabase.co
     """
-    u = url.strip().rstrip("/")
-    u = u.replace("%2F", "/").replace("%2f", "/")  # de-encode slashes if user pasted encoded
+    u = (url or "").strip().rstrip("/")
+    u = u.replace("%2F", "/").replace("%2f", "/")
     if u.endswith("/rest/v1"):
         u = u[:-len("/rest/v1")]
-    # sanity: must have scheme + netloc
     parsed = urlparse(u)
     if not (parsed.scheme and parsed.netloc):
         raise ValueError(f"Invalid SUPABASE_URL: {url!r}")
@@ -42,11 +41,11 @@ class Supa:
             return None
         endpoint = f"{self.base}/rest/v1/{table}"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-            async with s.post(endpoint, headers=self._headers(), json=rows, params={"select":"*"}) as r:
+            async with s.post(endpoint, headers=self._headers(), json=rows, params={"select": "*"}) as r:
                 if r.status // 100 != 2:
-                    # swallow but return None to keep bot healthy
+                    # swallow errors to keep the bot resilient
                     try:
-                        _ = await r.text()
+                        await r.text()
                     except Exception:
                         pass
                     return None
@@ -55,17 +54,18 @@ class Supa:
                 except Exception:
                     return None
 
-    # ---- public, fire-and-forget wrappers ----
+    # -------- fire‑and‑forget wrappers (do not block scan loop) --------
     def log_signal_bg(self, **kwargs) -> None:
         asyncio.create_task(self.log_signal(**kwargs))
 
     def log_execution_bg(self, **kwargs) -> None:
         asyncio.create_task(self.log_execution(**kwargs))
 
+    # -------- async writers --------
     async def log_signal(
         self,
         *,
-        signal_type: str,  # "spot" | "basis"
+        signal_type: str,   # "spot" | "basis"
         venue: str,
         symbol: str,
         interval: str,
