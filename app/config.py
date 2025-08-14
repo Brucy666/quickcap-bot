@@ -1,14 +1,14 @@
 # app/config.py
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 import os
 
-# --------- Hard defaults (works even with no env set) ---------
+# --------- Safe defaults ---------
 DEFAULTS = {
     "EXCHANGES": "kucoin",
     "SYMBOLS": "BTCUSDT,ETHUSDT",
     "INTERVAL": "1m",                 # allowed: 1m,3m,5m,15m,1h
     "LOOKBACK_CANDLES": "500",
-    "DISCORD_WEBHOOK": "",            # optional; logs if empty
+    "DISCORD_WEBHOOK": "",
     "RISK_OFF": "false",
     "ALERT_COOLDOWN_SEC": "180",
     "SCAN_PERIOD_SEC": "60",
@@ -23,6 +23,44 @@ DEFAULTS = {
 }
 _VALID_INTERVALS = {"1m", "3m", "5m", "15m", "1h"}
 
+# --------- helpers (sanitize + parse) ---------
+def _raw_env(key: str) -> str | None:
+    v = os.getenv(key)
+    return v if v is not None and v != "" else None
+
+def _sanitize(v: str) -> str:
+    s = v.strip()
+    # remove surrounding quotes if present
+    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+        s = s[1:-1].strip()
+    # drop stray backslashes
+    s = s.replace("\\", "").strip()
+    return s
+
+def _get(key: str) -> str:
+    v = _raw_env(key)
+    return _sanitize(v) if v is not None else DEFAULTS[key]
+
+def _split_csv(v: str) -> list[str]:
+    s = _sanitize(v)
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+def _to_bool(v: str) -> bool:
+    return _sanitize(v).lower() in {"1", "true", "yes", "y", "on"}
+
+def _to_int(v: str, default: int) -> int:
+    try:
+        return int(_sanitize(v))
+    except Exception:
+        return int(default)
+
+def _to_float(v: str, default: float) -> float:
+    try:
+        return float(_sanitize(v))
+    except Exception:
+        return float(default)
+
+# --------- Settings ---------
 class Settings(BaseModel):
     # Core
     exchanges: list[str] = Field(default_factory=lambda: DEFAULTS["EXCHANGES"].split(","))
@@ -50,39 +88,26 @@ class Settings(BaseModel):
 
     def validate_interval(self):
         if self.interval not in _VALID_INTERVALS:
-            raise ValueError(f"INTERVAL must be one of {_VALID_INTERVALS}, got '{self.interval}'")
-
-def _env(key: str) -> str:
-    val = os.getenv(key)
-    return val if val is not None and val != "" else DEFAULTS[key]
-
-def _split_csv(val: str) -> list[str]:
-    return [x.strip() for x in val.split(",") if x.strip()]
-
-def _to_bool(val: str) -> bool:
-    return val.strip().lower() in {"1","true","yes","y","on"}
+            raise SystemExit(f"[CONFIG ERROR] INTERVAL must be one of {_VALID_INTERVALS}, got '{self.interval}'")
 
 def load_settings() -> Settings:
-    try:
-        s = Settings(
-            exchanges=_split_csv(_env("EXCHANGES")),
-            symbols=_split_csv(_env("SYMBOLS")),
-            interval=_env("INTERVAL"),
-            lookback=int(_env("LOOKBACK_CANDLES")),
-            discord_webhook=_env("DISCORD_WEBHOOK") or None,
-            risk_off=_to_bool(_env("RISK_OFF")),
-            alert_cooldown_sec=int(_env("ALERT_COOLDOWN_SEC")),
-            scan_period_sec=int(_env("SCAN_PERIOD_SEC")),
-            alert_min_score=float(_env("ALERT_MIN_SCORE")),
-            momentum_z=float(_env("MOMENTUM_Z")),
-            max_pos_usdt=float(_env("MAX_POSITION_PER_SYMBOL_USDT")),
-            kucoin_key=_env("KUCOIN_API_KEY") or None,
-            kucoin_secret=_env("KUCOIN_API_SECRET") or None,
-            kucoin_passphrase=_env("KUCOIN_API_PASSPHRASE") or None,
-            mexc_key=_env("MEXC_API_KEY") or None,
-            mexc_secret=_env("MEXC_API_SECRET") or None,
-        )
-        s.validate_interval()
-        return s
-    except (ValidationError, ValueError) as e:
-        raise SystemExit(f"[CONFIG ERROR] {e}")
+    s = Settings(
+        exchanges=_split_csv(_get("EXCHANGES")),
+        symbols=_split_csv(_get("SYMBOLS")),
+        interval=_get("INTERVAL"),
+        lookback=_to_int(_get("LOOKBACK_CANDLES"), int(DEFAULTS["LOOKBACK_CANDLES"])),
+        discord_webhook=_get("DISCORD_WEBHOOK") or None,
+        risk_off=_to_bool(_get("RISK_OFF")),
+        alert_cooldown_sec=_to_int(_get("ALERT_COOLDOWN_SEC"), int(DEFAULTS["ALERT_COOLDOWN_SEC"])),
+        scan_period_sec=_to_int(_get("SCAN_PERIOD_SEC"), int(DEFAULTS["SCAN_PERIOD_SEC"])),
+        alert_min_score=_to_float(_get("ALERT_MIN_SCORE"), float(DEFAULTS["ALERT_MIN_SCORE"])),
+        momentum_z=_to_float(_get("MOMENTUM_Z"), float(DEFAULTS["MOMENTUM_Z"])),
+        max_pos_usdt=_to_float(_get("MAX_POSITION_PER_SYMBOL_USDT"), float(DEFAULTS["MAX_POSITION_PER_SYMBOL_USDT"])),
+        kucoin_key=_get("KUCOIN_API_KEY") or None,
+        kucoin_secret=_get("KUCOIN_API_SECRET") or None,
+        kucoin_passphrase=_get("KUCOIN_API_PASSPHRASE") or None,
+        mexc_key=_get("MEXC_API_KEY") or None,
+        mexc_secret=_get("MEXC_API_SECRET") or None,
+    )
+    s.validate_interval()
+    return s
