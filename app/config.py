@@ -1,13 +1,15 @@
-# app/config.py
 from pydantic import BaseModel, Field
 import os
 
-# --------- Safe defaults ---------
+# ===== Defaults =====
 DEFAULTS = {
+    # Core scanning
     "EXCHANGES": "kucoin",
     "SYMBOLS": "BTCUSDT,ETHUSDT",
-    "INTERVAL": "1m",                 # allowed: 1m,3m,5m,15m,1h
+    "INTERVAL": "1m",
     "LOOKBACK_CANDLES": "500",
+
+    # Alerts
     "DISCORD_WEBHOOK": "",
     "RISK_OFF": "false",
     "ALERT_COOLDOWN_SEC": "180",
@@ -15,25 +17,32 @@ DEFAULTS = {
     "ALERT_MIN_SCORE": "2.0",
     "MOMENTUM_Z": "2.0",
     "MAX_POSITION_PER_SYMBOL_USDT": "200",
-    "KUCOIN_API_KEY": "",
-    "KUCOIN_API_SECRET": "",
-    "KUCOIN_API_PASSPHRASE": "",
-    "MEXC_API_KEY": "",
-    "MEXC_API_SECRET": "",
+
+    # Hotlist
+    "HOTLIST_ENABLED": "true",
+    "HOTLIST_TOP_N": "20",
+    "HOTLIST_MIN_VOL_USDT": "200000",
+    "FORCE_SYMBOLS": "BTCUSDT,ETHUSDT",
+    "EXCLUDE_SYMBOLS": "",
+
+    # Spot↔Perp basis
+    "SPOT_PERP_ENABLED": "true",
+    "SPOT_PERP_Z": "2.5",
+    "SPOT_PERP_SYNC_TOL_SEC": "30",
+    "SPOT_PERP_EXCHANGES": "binance,bybit,okx",
 }
+
 _VALID_INTERVALS = {"1m", "3m", "5m", "15m", "1h"}
 
-# --------- helpers (sanitize + parse) ---------
+# ===== Helpers =====
 def _raw_env(key: str) -> str | None:
     v = os.getenv(key)
     return v if v is not None and v != "" else None
 
 def _sanitize(v: str) -> str:
     s = v.strip()
-    # remove surrounding quotes if present
     if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
         s = s[1:-1].strip()
-    # drop stray backslashes
     s = s.replace("\\", "").strip()
     return s
 
@@ -46,7 +55,7 @@ def _split_csv(v: str) -> list[str]:
     return [p.strip() for p in s.split(",") if p.strip()]
 
 def _to_bool(v: str) -> bool:
-    return _sanitize(v).lower() in {"1", "true", "yes", "y", "on"}
+    return _sanitize(v).lower() in {"1","true","yes","y","on"}
 
 def _to_int(v: str, default: int) -> int:
     try:
@@ -60,7 +69,7 @@ def _to_float(v: str, default: float) -> float:
     except Exception:
         return float(default)
 
-# --------- Settings ---------
+# ===== Settings =====
 class Settings(BaseModel):
     # Core
     exchanges: list[str] = Field(default_factory=lambda: DEFAULTS["EXCHANGES"].split(","))
@@ -68,23 +77,27 @@ class Settings(BaseModel):
     interval: str = DEFAULTS["INTERVAL"]
     lookback: int = int(DEFAULTS["LOOKBACK_CANDLES"])
 
-    # Alert & control
+    # Alerts
     discord_webhook: str | None = DEFAULTS["DISCORD_WEBHOOK"] or None
     risk_off: bool = False
     alert_cooldown_sec: int = int(DEFAULTS["ALERT_COOLDOWN_SEC"])
     scan_period_sec: int = int(DEFAULTS["SCAN_PERIOD_SEC"])
     alert_min_score: float = float(DEFAULTS["ALERT_MIN_SCORE"])
     momentum_z: float = float(DEFAULTS["MOMENTUM_Z"])
-
-    # Sizing
     max_pos_usdt: float = float(DEFAULTS["MAX_POSITION_PER_SYMBOL_USDT"])
 
-    # Keys (optional for scanning)
-    kucoin_key: str | None = None
-    kucoin_secret: str | None = None
-    kucoin_passphrase: str | None = None
-    mexc_key: str | None = None
-    mexc_secret: str | None = None
+    # Hotlist
+    hotlist_enabled: bool = True
+    hotlist_top_n: int = 20
+    hotlist_min_vol_usdt: float = 200_000.0
+    force_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT","ETHUSDT"])
+    exclude_symbols: list[str] = Field(default_factory=list)
+
+    # Spot↔Perp
+    spot_perp_enabled: bool = True
+    spot_perp_z: float = 2.5
+    spot_perp_sync_tol_sec: int = 30
+    spot_perp_exchanges: list[str] = Field(default_factory=lambda: ["binance","bybit","okx"])
 
     def validate_interval(self):
         if self.interval not in _VALID_INTERVALS:
@@ -103,11 +116,15 @@ def load_settings() -> Settings:
         alert_min_score=_to_float(_get("ALERT_MIN_SCORE"), float(DEFAULTS["ALERT_MIN_SCORE"])),
         momentum_z=_to_float(_get("MOMENTUM_Z"), float(DEFAULTS["MOMENTUM_Z"])),
         max_pos_usdt=_to_float(_get("MAX_POSITION_PER_SYMBOL_USDT"), float(DEFAULTS["MAX_POSITION_PER_SYMBOL_USDT"])),
-        kucoin_key=_get("KUCOIN_API_KEY") or None,
-        kucoin_secret=_get("KUCOIN_API_SECRET") or None,
-        kucoin_passphrase=_get("KUCOIN_API_PASSPHRASE") or None,
-        mexc_key=_get("MEXC_API_KEY") or None,
-        mexc_secret=_get("MEXC_API_SECRET") or None,
+        hotlist_enabled=_to_bool(_get("HOTLIST_ENABLED")),
+        hotlist_top_n=_to_int(_get("HOTLIST_TOP_N"), int(DEFAULTS["HOTLIST_TOP_N"])),
+        hotlist_min_vol_usdt=_to_float(_get("HOTLIST_MIN_VOL_USDT"), float(DEFAULTS["HOTLIST_MIN_VOL_USDT"])),
+        force_symbols=_split_csv(_get("FORCE_SYMBOLS")),
+        exclude_symbols=_split_csv(_get("EXCLUDE_SYMBOLS")),
+        spot_perp_enabled=_to_bool(_get("SPOT_PERP_ENABLED")),
+        spot_perp_z=_to_float(_get("SPOT_PERP_Z"), float(DEFAULTS["SPOT_PERP_Z"])),
+        spot_perp_sync_tol_sec=_to_int(_get("SPOT_PERP_SYNC_TOL_SEC"), int(DEFAULTS["SPOT_PERP_SYNC_TOL_SEC"])),
+        spot_perp_exchanges=_split_csv(_get("SPOT_PERP_EXCHANGES")),
     )
     s.validate_interval()
     return s
