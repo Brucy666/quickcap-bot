@@ -1,3 +1,12 @@
+# app/main.py
+# --- Quiet noisy warnings & adopt pandas future behavior ---
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+import pandas as pd
+pd.set_option("future.no_silent_downcasting", True)
+# -----------------------------------------------------------
+
 import asyncio
 import time
 from typing import Dict, Tuple
@@ -12,17 +21,24 @@ from app.executor import PaperExecutor
 from app.notifier import post_signal_embed
 
 log = get_logger("main")
+
+# cooldown cache: (exchange, symbol) -> last_alert_ts
 LAST_ALERT: Dict[Tuple[str, str], float] = {}
+
 
 def _build_exchanges(enabled: list[str]):
     exes = []
-    if "kucoin" in enabled: exes.append(("kucoin", KuCoinPublic()))
-    if "mexc" in enabled:   exes.append(("mexc", MEXCPublic()))
+    if "kucoin" in enabled:
+        exes.append(("kucoin", KuCoinPublic()))
+    if "mexc" in enabled:
+        exes.append(("mexc", MEXCPublic()))
     return exes
+
 
 async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
     kl = await ex.fetch_klines(symbol, interval, lookback)
     return to_dataframe(kl)
+
 
 async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExecutor):
     try:
@@ -35,17 +51,21 @@ async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExe
         last = sig.iloc[-1].copy()
         last["score"] = float(score_row(last))
 
-        triggers = []
-        if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
-        if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
-        if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
+        triggers: list[str] = []
+        if last.get("sweep_long") and last.get("bull_div"):
+            triggers.append("VWAP sweep + Bull Div")
+        if last.get("sweep_short") and last.get("bear_div"):
+            triggers.append("VWAP sweep + Bear Div")
+        if bool(last.get("mom_pop")):
+            triggers.append("Momentum Pop")
 
         if cfg.risk_off:
             log.info(f"{ex_name}:{symbol} risk_off=True | price={last['close']:.4f}")
             return
 
         if triggers and last["score"] >= cfg.alert_min_score:
-            now = time.time(); key = (ex_name, symbol)
+            now = time.time()
+            key = (ex_name, symbol)
             if now - LAST_ALERT.get(key, 0) < cfg.alert_cooldown_sec:
                 log.info(f"{ex_name}:{symbol} skipped (cooldown)")
                 return
@@ -53,6 +73,7 @@ async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExe
 
             side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
 
+            # Discord embed
             await post_signal_embed(
                 cfg.discord_webhook,
                 exchange=ex_name,
@@ -65,12 +86,23 @@ async def _process_symbol(cfg, ex_name: str, ex, symbol: str, executor: PaperExe
                 score=float(last["score"]),
                 triggers=triggers,
             )
+            # Mirror in logs for audit
+            log.info(
+                f"ALERT {ex_name}:{symbol} {side} price={last['close']:.4f} "
+                f"rsi={last['rsi']:.1f} vwap={last['vwap']:.4f} score={last['score']} "
+                f"triggers={','.join(triggers)}"
+            )
+
             await executor.submit(symbol, side, float(last["close"]), float(last["score"]), ", ".join(triggers))
         else:
-            vwap_delta = (last["close"] - last["vwap"]) / last["vwap"] * 100.0
-            log.info(f"{ex_name}:{symbol} ok | price={last['close']:.4f} rsi={last['rsi']:.1f} vwapΔ={vwap_delta:.2f}% score={last['score']}")
+            vwap_delta = (last["close"] - last["vwap"]) / (last["vwap"] + 1e-12) * 100.0
+            log.info(
+                f"{ex_name}:{symbol} ok | price={last['close']:.4f} "
+                f"rsi={last['rsi']:.1f} vwapΔ={vwap_delta:.2f}% score={last['score']}"
+            )
     except Exception as e:
         log.error(f"{ex_name}:{symbol} error: {e}")
+
 
 async def scan_once():
     cfg = load_settings()
@@ -80,17 +112,23 @@ async def scan_once():
         for sym in cfg.symbols:
             await _process_symbol(cfg, ex_name, ex, sym, executor)
 
+
 async def main_loop():
     cfg = load_settings()
-    period = max(10, int(cfg.scan_period_sec))
-    log.info(f"Starting scan loop | exchanges={cfg.exchanges} symbols={cfg.symbols} interval={cfg.interval} period={period}s")
+    period = max(10, int(cfg.scan_period_sec))  # safety floor
+    log.info(
+        f"Starting scan loop | exchanges={cfg.exchanges} symbols={cfg.symbols} "
+        f"interval={cfg.interval} period={period}s"
+    )
     while True:
         await scan_once()
         await asyncio.sleep(period)
 
+
 if __name__ == "__main__":
     try:
-        import uvloop; uvloop.install()
+        import uvloop
+        uvloop.install()
     except Exception:
         pass
     asyncio.run(main_loop())
