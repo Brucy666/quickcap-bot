@@ -1,7 +1,9 @@
 # app/backfill/backfill.py
-import asyncio, argparse, json
+import asyncio
+import argparse
+import json
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Dict
 
 import pandas as pd
 
@@ -10,7 +12,9 @@ from app.signals import compute_signals
 from app.scoring import score_row
 from app.storage.sqlite_store import SQLiteStore
 from app.backtest.metrics import compute_outcomes_sqlite_rows
-from app.exchanges import KuCoinPublic, MEXCPublic, BinanceSpotPublic, OKXSpotPublic, BybitSpotPublic
+from app.exchanges import (
+    KuCoinPublic, MEXCPublic, BinanceSpotPublic, OKXSpotPublic, BybitSpotPublic
+)
 from app.config import load_settings
 from app.storage.supabase import Supa
 
@@ -29,30 +33,49 @@ async def _fetch_df(ex_cls, symbol: str, interval: str, lookback: int) -> pd.Dat
     ex = ex_cls()
     try:
         kl = await ex.fetch_klines(symbol, interval, lookback)
-    except Exception:
+    except Exception as e:
+        print(f"[BACKFILL] fetch_klines error {ex_cls.__name__} {symbol} {interval}: {e}")
         kl = []
     return to_dataframe(kl)
 
-async def backfill_symbol(venue: str, symbol: str, interval: str, lookback: int,
-                          alert_min_score: float, cooldown_sec: int, sqlite_path: str,
-                          supa: Supa | None):
+async def backfill_symbol(
+    venue: str,
+    symbol: str,
+    interval: str,
+    lookback: int,
+    alert_min_score: float,
+    cooldown_sec: int,
+    sqlite_path: str,
+    supa: Supa | None,
+) -> Dict[str, int]:
+    if venue not in SPOT:
+        print(f"[BACKFILL] unsupported venue '{venue}'")
+        return {"signals": 0, "executions": 0, "outcomes": 0}
+
     store = SQLiteStore(sqlite_path)
     df = await _fetch_df(SPOT[venue], symbol, interval, lookback)
+    print(f"[BACKFILL] fetched {len(df)} bars for {venue}:{symbol}:{interval}")
     if len(df) < 100:
-        return {"signals":0,"executions":0,"outcomes":0}
+        return {"signals": 0, "executions": 0, "outcomes": 0}
 
     last_alert = 0.0
     sig_ct = exe_ct = 0
-    for i in range(50, len(df)-1):
-        window = df.iloc[:i+1].copy()
+
+    # bar-by-bar replay (no lookahead)
+    for i in range(50, len(df) - 1):
+        window = df.iloc[: i + 1].copy()
         sig = compute_signals(window)
         last = sig.iloc[-1].copy()
         last["score"] = float(score_row(last))
 
         triggers: List[str] = []
-        if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
-        if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
-        if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
+        if last.get("sweep_long") and last.get("bull_div"):
+            triggers.append("VWAP sweep + Bull Div")
+        if last.get("sweep_short") and last.get("bear_div"):
+            triggers.append("VWAP sweep + Bear Div")
+        if bool(last.get("mom_pop")):
+            triggers.append("Momentum Pop")
+
         if not triggers or last["score"] < alert_min_score:
             continue
 
@@ -77,11 +100,20 @@ async def backfill_symbol(venue: str, symbol: str, interval: str, lookback: int,
             "score": float(last["score"]),
             "triggers": triggers,
         }
-        store.insert_signal(signal_row); sig_ct += 1
-        if supa:
-            asyncio.create_task(supa.log_signal(**signal_row))
 
-        nxt = df.iloc[i+1]
+        # local insert (fast dev / parity with backtests)
+        store.insert_signal(signal_row)
+        sig_ct += 1
+
+        # cloud mirror (idempotent upsert via Supa)
+        if supa:
+            try:
+                asyncio.create_task(supa.log_signal(**signal_row))
+            except Exception as e:
+                print(f"[WARN] supa.log_signal: {e}")
+
+        # deterministic paper fill at next bar open
+        nxt = df.iloc[i + 1]
         exec_row = {
             "ts": _iso_utc(nxt["ts"].timestamp()),
             "venue": "PAPER",
@@ -92,17 +124,25 @@ async def backfill_symbol(venue: str, symbol: str, interval: str, lookback: int,
             "reason": ", ".join(triggers),
             "is_paper": True,
         }
-        store.insert_execution(exec_row); exe_ct += 1
-        if supa:
-            asyncio.create_task(supa.log_execution(**exec_row))
+        store.insert_execution(exec_row)
+        exe_ct += 1
 
-    # compute outcomes (writes to SQLite) and mirror to Supabase
+        if supa:
+            try:
+                asyncio.create_task(supa.log_execution(**exec_row))
+            except Exception as e:
+                print(f"[WARN] supa.log_execution: {e}")
+
+    # compute outcomes; upsert to SQLite and mirror to Supabase
     out_rows = await compute_outcomes_sqlite_rows(venue, symbol, interval, lookback, store)
     if supa and out_rows:
-        # idempotent via (signal_id,horizon_m) unique key in schema
-        await supa.bulk_insert("signal_outcomes", out_rows, on_conflict="signal_id,horizon_m")
+        try:
+            await supa.bulk_insert("signal_outcomes", out_rows, on_conflict="signal_id,horizon_m")
+        except Exception as e:
+            print(f"[WARN] supa.bulk_insert(signal_outcomes): {e}")
 
-    return {"signals":sig_ct,"executions":exe_ct,"outcomes":len(out_rows)}
+    print(f"[BACKFILL] {venue}:{symbol}:{interval} -> signals={sig_ct} executions={exe_ct} outcomes={len(out_rows)}")
+    return {"signals": sig_ct, "executions": exe_ct, "outcomes": len(out_rows)}
 
 async def main():
     p = argparse.ArgumentParser(description="QuickCap historical backfill")
@@ -118,18 +158,22 @@ async def main():
     cfg = load_settings()
     supa = Supa(cfg.supabase_url, cfg.supabase_key) if getattr(cfg, "supabase_enabled", False) else None
 
-    totals = {"signals":0,"executions":0,"outcomes":0}
+    totals = {"signals": 0, "executions": 0, "outcomes": 0}
     for sym in [s.strip() for s in args.symbols.split(",") if s.strip()]:
-        res = await backfill_symbol(args.venue, sym, args.interval, args.lookback,
-                                    args.score, args.cooldown, args.sqlite, supa)
-        for k in totals: totals[k] += res[k]
+        res = await backfill_symbol(
+            args.venue, sym, args.interval, args.lookback,
+            args.score, args.cooldown, args.sqlite, supa
+        )
+        for k in totals:
+            totals[k] += res[k]
         print(f"[BACKFILL] {args.venue}:{sym}:{args.interval} -> {res}")
 
     print(json.dumps(totals))
 
 if __name__ == "__main__":
     try:
-        import uvloop; uvloop.install()
+        import uvloop  # type: ignore
+        uvloop.install()
     except Exception:
         pass
     asyncio.run(main())
