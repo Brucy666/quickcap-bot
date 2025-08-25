@@ -1,54 +1,73 @@
 # app/tools/report.py
-import os, asyncio, aiohttp, math
+import os, asyncio, aiohttp, json
 
 BASE = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1"
 KEY  = os.environ["SUPABASE_KEY"]
 HEAD = {"apikey": KEY, "Authorization": f"Bearer {KEY}"}
 
-async def fetch_all(table, select="*", limit=10000):
-    out = []; from_ = 0
-    async with aiohttp.ClientSession() as s:
-        while True:
-            params = {"select": select}
-            headers = dict(HEAD); headers["Range-Unit"]="items"
-            headers["Range"]=f"{from_}-{from_+limit-1}"
-            async with s.get(f"{BASE}/{table}", headers=headers, params=params) as r:
-                rows = await r.json()
-                if not rows: break
-                out.extend(rows)
-                if len(rows) < limit: break
-                from_ += limit
-    return out
-
-def group(rows, key_fn):
-    d = {}
-    for r in rows:
-        k = key_fn(r); d.setdefault(k, []).append(r)
-    return d
+async def query(sql: str):
+    url = BASE.replace("/rest/v1", "") + "/rest/v1/rpc"
+    headers = dict(HEAD)
+    headers["Content-Type"] = "application/json"
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(url, headers=headers, data=json.dumps({"query": sql})) as r:
+            text = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"Supabase SQL error {r.status}: {text}")
+            return json.loads(text)
 
 async def main():
-    rows = await fetch_all("v_signal_perf",
-        select="symbol,horizon_m,score,ret,max_fav,max_adv")
-    if not rows:
-        print("No rows in v_signal_perf yet."); return
-
-    # 1) Perf by symbol & horizon
-    by_sh = group(rows, lambda r:(r["symbol"], r["horizon_m"]))
+    # Performance by symbol & horizon
+    sql = """
+    select s.symbol, o.horizon_m,
+           count(*) as n,
+           round(avg(case when o.ret>0 then 1 else 0 end)::numeric,3) as winrate,
+           round(avg(o.ret)::numeric,6) as expectancy,
+           round(avg(o.max_fav)::numeric,6) as avg_mfe,
+           round(avg(o.max_adv)::numeric,6) as avg_mae
+    from signal_outcomes o
+    join signals s on s.id=o.signal_id
+    group by s.symbol, o.horizon_m
+    order by s.symbol, o.horizon_m;
+    """
+    rows = await query(sql)
     print("\n=== Performance by Symbol & Horizon ===")
-    for (sym,h), rs in sorted(by_sh.items()):
-        n = len(rs)
-        win = sum(1 for r in rs if (r["ret"] or 0) > 0)
-        exp = sum(r["ret"] or 0 for r in rs)/n
-        mfe = sum(r["max_fav"] or 0 for r in rs)/n
-        mae = sum(r["max_adv"] or 0 for r in rs)/n
-        print(f"{sym:10s} h={h:2d} | n={n:4d} winrate={win/n:0.3f} exp={exp:0.6f} mfe={mfe:0.6f} mae={mae:0.6f}")
+    for r in rows:
+        print(r)
 
-    # 2) Score→expectancy
-    by_bucket = group(rows, lambda r:(round((r["score"] or 0),1), r["horizon_m"]))
+    # By trigger
+    sql2 = """
+    with x as (
+      select s.symbol,o.horizon_m,o.ret,
+             jsonb_array_elements_text(s.triggers) as trig
+      from signal_outcomes o
+      join signals s on s.id=o.signal_id
+    )
+    select trig,horizon_m,count(*) n,
+           round(avg(case when ret>0 then 1 else 0 end)::numeric,3) as winrate,
+           round(avg(ret)::numeric,6) as expectancy
+    from x
+    group by trig,horizon_m
+    order by expectancy desc;
+    """
+    rows2 = await query(sql2)
+    print("\n=== Performance by Trigger ===")
+    for r in rows2:
+        print(r)
+
+    # By score bucket
+    sql3 = """
+    select round(s.score,1) as score_bucket, o.horizon_m,
+           count(*) as n, round(avg(o.ret)::numeric,6) as expectancy
+    from signal_outcomes o
+    join signals s on s.id=o.signal_id
+    group by score_bucket,o.horizon_m
+    order by o.horizon_m, score_bucket;
+    """
+    rows3 = await query(sql3)
     print("\n=== Expectancy by Score Bucket ===")
-    for (b,h), rs in sorted(by_bucket.items()):
-        n = len(rs); exp = sum(r["ret"] or 0 for r in rs)/n
-        print(f"score~{b:4.1f} h={h:2d} | n={n:4d} exp={exp:0.6f}")
+    for r in rows3:
+        print(r)
 
 if __name__ == "__main__":
     asyncio.run(main())
