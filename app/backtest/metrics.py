@@ -46,23 +46,27 @@ def _calc_window(df, i0: int, bars: int, side: str, entry: float):
         mae = (hi / entry - 1.0)
     return ret, mfe, mae, exit_price
 
-async def compute_outcomes_sqlite(venue: str, symbol: str, interval: str, lookback: int, store: SQLiteStore):
+async def compute_outcomes_sqlite_rows(venue: str, symbol: str, interval: str, lookback: int, store: SQLiteStore):
+    """Fetch klines, compute horizons for all signals of (venue,symbol,interval).
+       Upserts into SQLite and returns the computed rows for mirroring to Supabase."""
     cls = SPOT.get(venue); ex = cls()
     kl = await ex.fetch_klines(symbol, interval, lookback)
     df = to_dataframe(kl)
     if len(df) == 0:
-        return 0
+        return []
 
     with store._conn() as con:
-        cur = con.execute("SELECT id, ts, side FROM signals WHERE venue=? AND symbol=? AND interval=? ORDER BY ts ASC",
-                          (venue, symbol, interval))
+        cur = con.execute(
+            "SELECT id, ts, side FROM signals WHERE venue=? AND symbol=? AND interval=? ORDER BY ts ASC",
+            (venue, symbol, interval)
+        )
         rows = cur.fetchall()
 
     out = []
     for sid, ts_iso, side in rows:
         ts_ms = int(datetime.fromisoformat(ts_iso.replace("Z","+00:00")).timestamp() * 1000)
         i0 = _nearest_index(df, ts_ms)
-        if i0 < 0: 
+        if i0 < 0:
             continue
         entry = float(df.iloc[i0]["close"])
         for h in HORIZONS_MIN:
@@ -77,5 +81,6 @@ async def compute_outcomes_sqlite(venue: str, symbol: str, interval: str, lookba
                 "max_fav": float(mfe),
                 "max_adv": float(mae),
             })
+    # persist locally
     store.upsert_outcomes(out)
-    return len(out)
+    return out
