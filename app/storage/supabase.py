@@ -1,163 +1,94 @@
 # app/storage/supabase.py
-import aiohttp, asyncio
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+# Minimal async Supabase (PostgREST) client for inserts/upserts.
+# Uses service_role key (server-side). Safe for Railway.
+from __future__ import annotations
+import json
+from typing import Any, Dict, Iterable, List, Optional, Union
+import aiohttp
 
-JSON = Dict[str, Any]
-
-def _normalize_base(url: str) -> str:
-    """
-    Acceptable inputs:
-      https://xxx.supabase.co
-      https://xxx.supabase.co/
-      https://xxx.supabase.co/rest/v1
-      https://xxx.supabase.co/%2Frest%2Fv1
-    Returns canonical base: https://xxx.supabase.co
-    """
-    u = (url or "").strip().rstrip("/")
-    u = u.replace("%2F", "/").replace("%2f", "/")
-    if u.endswith("/rest/v1"):
-        u = u[:-len("/rest/v1")]
-    parsed = urlparse(u)
-    if not (parsed.scheme and parsed.netloc):
-        raise ValueError(f"Invalid SUPABASE_URL: {url!r}")
-    return u
+Row = Dict[str, Any]
 
 class Supa:
-    def __init__(self, url: str, key: str):
-        self.base = _normalize_base(url)
-        self.key = key
+    def __init__(self, url: str, service_key: str, timeout: int = 20):
+        if not url.endswith("/"):
+            url += "/"
+        self.base = url + "rest/v1/"
+        self.key = service_key
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
 
-    # ---------- low level ----------
-    def _headers(self) -> dict:
-        return {
+    # ---------- public convenience ----------
+    async def log_signal(self, **row: Any) -> Row:
+        """Insert one row into signals; accepts aliases for timestamp etc."""
+        row = self._normalize_signal_row(row)
+        return await self.insert("signals", row)
+
+    async def log_execution(self, **row: Any) -> Row:
+        """Insert one row into executions; accepts aliases for timestamp etc."""
+        row = self._normalize_ts_alias(row)
+        return await self.insert("executions", row)
+
+    async def insert(self, table: str, rows: Union[Row, List[Row]]) -> Row:
+        """Insert 1..N rows; returns representation from PostgREST."""
+        payload = rows if isinstance(rows, list) else [rows]
+        return await self._post(table, payload, prefer="return=representation")
+
+    async def bulk_insert(self, table: str, rows: Iterable[Row], on_conflict: Optional[str] = None) -> Row:
+        """Bulk insert; optional upsert on_conflict='col1,col2'."""
+        batch = list(rows)
+        prefer = "return=representation"
+        params = {}
+        if on_conflict:
+            prefer = "resolution=merge-duplicates,return=representation"
+            params["on_conflict"] = on_conflict
+        return await self._post(table, batch, prefer=prefer, params=params)
+
+    async def upsert(self, table: str, rows: Union[Row, List[Row]], on_conflict: str) -> Row:
+        """Upsert rows with given conflict columns (CSV)."""
+        payload = rows if isinstance(rows, list) else [rows]
+        return await self._post(
+            table,
+            payload,
+            prefer="resolution=merge-duplicates,return=representation",
+            params={"on_conflict": on_conflict},
+        )
+
+    # ---------- internal ----------
+    async def _post(self, table: str, payload: List[Row], prefer: str, params: Optional[Dict[str, str]] = None) -> Row:
+        url = self.base + table
+        headers = {
             "apikey": self.key,
             "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
-            "Prefer": "return=representation",
+            "Prefer": prefer,
         }
+        async with aiohttp.ClientSession(timeout=self.timeout) as sess:
+            async with sess.post(url, headers=headers, params=params or {}, data=json.dumps(payload)) as r:
+                text = await r.text()
+                if r.status >= 400:
+                    raise RuntimeError(f"Supabase {table} insert failed [{r.status}]: {text}")
+                # PostgREST returns a JSON array for return=representation
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = {"ok": True, "raw": text}
+                return data
 
-    async def _post(self, table: str, rows: List[JSON], params: Optional[dict] = None) -> Optional[List[JSON]]:
-        if not rows:
-            return None
-        endpoint = f"{self.base}/rest/v1/{table}"
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
-                async with s.post(endpoint, headers=self._headers(), json=rows, params=params or {"select": "*"}) as r:
-                    # Swallow non-2xx without crashing the bot
-                    if r.status // 100 != 2:
-                        _ = await r.text()
-                        return None
-                    try:
-                        return await r.json()
-                    except Exception:
-                        return None
-        except Exception:
-            return None
+    # ---------- normalization helpers ----------
+    def _normalize_ts_alias(self, row: Row) -> Row:
+        # Accept 'ts', 'timestamp', 'ts_iso' → store as 'ts'
+        if "ts" not in row:
+            if "timestamp" in row:
+                row["ts"] = row.pop("timestamp")
+            elif "ts_iso" in row:
+                row["ts"] = row.pop("ts_iso")
+        # Ensure JSON-friendly types
+        if "triggers" in row and isinstance(row["triggers"], (set, tuple)):
+            row["triggers"] = list(row["triggers"])
+        return row
 
-    async def select(self, table: str, params: dict) -> List[JSON]:
-        """GET /rest/v1/<table>?<params>; returns [] on error."""
-        endpoint = f"{self.base}/rest/v1/{table}"
-        q = dict(params or {})
-        q.setdefault("select", "*")
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
-                async with s.get(endpoint, headers=self._headers(), params=q) as r:
-                    if r.status // 100 != 2:
-                        _ = await r.text()
-                        return []
-                    try:
-                        return await r.json()
-                    except Exception:
-                        return []
-        except Exception:
-            return []
-
-    async def insert(self, table: str, rows: List[JSON]) -> Optional[List[JSON]]:
-        """Simple INSERT; returns created rows or None on error."""
-        return await self._post(table, rows, params={"select": "*"})
-
-    async def upsert(self, table: str, rows: List[JSON], on_conflict: str) -> Optional[List[JSON]]:
-        """UPSERT using `on_conflict` columns, merge-duplicates preference."""
-        if not rows:
-            return None
-        endpoint = f"{self.base}/rest/v1/{table}"
-        params = {"on_conflict": on_conflict, "select": "*"}
-        headers = self._headers() | {"Prefer": "resolution=merge-duplicates,return=representation"}
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
-                async with s.post(endpoint, headers=headers, params=params, json=rows) as r:
-                    if r.status // 100 != 2:
-                        _ = await r.text()
-                        return None
-                    try:
-                        return await r.json()
-                    except Exception:
-                        return None
-        except Exception:
-            return None
-
-    # ---------- fire-and-forget wrappers ----------
-    def log_signal_bg(self, **kwargs) -> None:
-        asyncio.create_task(self.log_signal(**kwargs))
-
-    def log_execution_bg(self, **kwargs) -> None:
-        asyncio.create_task(self.log_execution(**kwargs))
-
-    # ---------- domain writers ----------
-    async def log_signal(
-        self,
-        *,
-        signal_type: str,  # "spot" | "basis"
-        venue: str,
-        symbol: str,
-        interval: str,
-        side: str,
-        price: float,
-        vwap: float,
-        rsi: float,
-        score: float,
-        triggers: List[str],
-        basis_pct: Optional[float] = None,
-        basis_z: Optional[float] = None,
-    ) -> None:
-        row: JSON = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "signal_type": signal_type,
-            "venue": venue,
-            "symbol": symbol,
-            "interval": interval,
-            "side": side,
-            "price": price,
-            "vwap": vwap,
-            "rsi": rsi,
-            "score": score,
-            "triggers": triggers,
-            "basis_pct": basis_pct,
-            "basis_z": basis_z,
-        }
-        await self.insert("signals", [row])
-
-    async def log_execution(
-        self,
-        *,
-        venue: str,
-        symbol: str,
-        side: str,
-        price: float,
-        score: float,
-        reason: str,
-        is_paper: bool = True,
-    ) -> None:
-        row: JSON = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "venue": venue,
-            "symbol": symbol,
-            "side": side,
-            "price": price,
-            "score": score,
-            "reason": reason,
-            "is_paper": is_paper,
-        }
-        await self.insert("executions", [row])
+    def _normalize_signal_row(self, row: Row) -> Row:
+        row = self._normalize_ts_alias(row)
+        # default fields if missing; Postgres will coerce types
+        row.setdefault("signal_type", "spot")
+        # Keep triggers as JSON (array/object); PostgREST accepts native JSON
+        return row
