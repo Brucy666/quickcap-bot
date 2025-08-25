@@ -29,6 +29,7 @@ PERP = {
     "binance": BinancePerpPublic, "okx": OKXPerpPublic, "bybit": BybitPerpPublic,
 }
 
+# --------------------- util ---------------------
 def _iso_utc(ts: float) -> str:
     return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).isoformat()
 
@@ -41,8 +42,7 @@ async def _fetch_df(ex_cls, symbol: str, interval: str, lookback: int) -> pd.Dat
         kl = []
     return to_dataframe(kl)
 
-# --------------------------- SPOT BACKFILL ---------------------------
-
+# --------------------- SPOT mode ---------------------
 async def backfill_symbol_spot(
     venue: str, symbol: str, interval: str, lookback: int,
     min_score: float, cooldown_sec: int, sqlite_path: str, supa: Supa | None,
@@ -98,15 +98,14 @@ async def backfill_symbol_spot(
     except Exception as e: print(f"[WARN] backfill summary discord: {e}")
     return {"signals":sig_ct,"executions":exe_ct,"outcomes":len(out_rows)}
 
-# --------------------------- BASIS BACKFILL ---------------------------
-
+# --------------------- BASIS mode ---------------------
 async def backfill_symbol_basis(
     venue: str, symbol: str, interval: str, lookback: int,
     min_score: float, cooldown_sec: int, sqlite_path: str, supa: Supa | None,
     z_win: int, z_th: float,
 ) -> Dict[str, int]:
     if venue not in PERP:
-        print(f"[BACKFILL] basis mode unsupported for venue '{venue}'"); 
+        print(f"[BACKFILL] basis mode unsupported for venue '{venue}'")
         return {"signals":0,"executions":0,"outcomes":0}
 
     store = SQLiteStore(sqlite_path)
@@ -118,7 +117,6 @@ async def backfill_symbol_basis(
 
     last_alert = 0.0
     sig_ct = exe_ct = 0
-    # step bar-by-bar with both feeds
     length = min(len(spot_df), len(perp_df))
     for i in range(max(50, z_win), length-1):
         s_win = spot_df.iloc[:i+1].copy()
@@ -128,7 +126,7 @@ async def backfill_symbol_basis(
         if not res.get("ok") or not res["triggers"]:
             continue
 
-        side = res["side"] or ("SHORT" if res["basis_pct"] > 0 else "LONG")
+        side = res["side"] or ("SHORT" if float(res["basis_pct"]) > 0 else "LONG")
         score = 2.0 + min(abs(float(res["basis_z"])), 5.0)
         if score < min_score: 
             continue
@@ -167,21 +165,21 @@ async def backfill_symbol_basis(
     except Exception as e: print(f"[WARN] backfill summary discord: {e}")
     return {"signals":sig_ct,"executions":exe_ct,"outcomes":len(out_rows)}
 
-# ----------------------------- CLI MAIN ------------------------------
-
+# --------------------- CLI ---------------------
 async def main():
     p = argparse.ArgumentParser(description="QuickCap historical backfill")
-    p.add_argument("--mode", choices=["spot","basis"], default="spot", help="which engine to backfill")
-    p.add_argument("--venue", required=False, default="kucoin", help="kucoin|binance|okx|bybit|mexc")
-    p.add_argument("--symbols", required=False, default="BTCUSDT,ETHUSDT")
+    # Safe defaults: BASIS mode on Binance, 1m, 2 weeks data, relaxed gates
+    p.add_argument("--mode", choices=["spot","basis"], default="basis")
+    p.add_argument("--venue", default="binance")
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,LTCUSDT,XRPUSDT,SUIUSDT")
     p.add_argument("--interval", default="1m")
-    p.add_argument("--lookback", type=int, default=50000)
-    p.add_argument("--score", type=float, default=2.3)
-    p.add_argument("--cooldown", type=int, default=180)
+    p.add_argument("--lookback", type=int, default=20000)
+    p.add_argument("--score", type=float, default=1.5)
+    p.add_argument("--cooldown", type=int, default=60)
     p.add_argument("--sqlite", default="quickcap_results.db")
     # basis tuning
     p.add_argument("--basis-z-win", type=int, default=50)
-    p.add_argument("--basis-z-th", type=float, default=2.0)
+    p.add_argument("--basis-z-th", type=float, default=1.0)
     args = p.parse_args()
 
     cfg = load_settings()
@@ -202,7 +200,7 @@ async def main():
 
     print(json.dumps(totals))
 
-    # performance report
+    # Performance report
     try:
         os.environ.setdefault("SUPABASE_URL", cfg.supabase_url)
         os.environ.setdefault("SUPABASE_KEY", cfg.supabase_key)
