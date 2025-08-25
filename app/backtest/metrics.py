@@ -1,13 +1,9 @@
-# app/backtest/metrics.py
+# app/backtest/metrics.py  (full file)
 from datetime import datetime, timezone
-from typing import Dict, Tuple, List
 import pandas as pd
-
 from app.utils import to_dataframe
 from app.storage.sqlite_store import SQLiteStore
-from app.exchanges import (
-    KuCoinPublic, MEXCPublic, BinanceSpotPublic, OKXSpotPublic, BybitSpotPublic
-)
+from app.exchanges import KuCoinPublic, MEXCPublic, BinanceSpotPublic, OKXSpotPublic, BybitSpotPublic
 
 SPOT = {
     "kucoin": KuCoinPublic,
@@ -20,58 +16,54 @@ SPOT = {
 HORIZONS_MIN = (15, 30, 60)
 
 def _dir(side: str) -> int:
-    return 1 if side.upper() == "LONG" else -1
+    return 1 if str(side).upper() == "LONG" else -1
 
 def _nearest_index(df: pd.DataFrame, ts_ms: int) -> int:
-    arr = df["ts"].astype("int64") // 10**6
-    for i, t in enumerate(arr):
-        if t >= ts_ms:
-            return i
-    return -1
+    arr = (df["ts"].astype("int64") // 10**6).to_numpy()
+    lo, hi = 0, len(arr) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if arr[mid] < ts_ms: lo = mid + 1
+        else: hi = mid - 1
+    return lo if lo < len(arr) else -1
 
-def _calc_window(df, i0: int, bars: int, side: str, entry: float):
+def _calc_window(df: pd.DataFrame, i_entry: int, bars: int, side: str, entry: float):
     d = _dir(side)
-    i1 = min(len(df)-1, i0 + max(1, bars))
-    seg = df.iloc[i0:i1+1]
+    i1 = min(len(df)-1, i_entry + max(1, bars))
+    seg = df.iloc[i_entry:i1+1]
     exit_price = float(seg.iloc[-1]["close"])
     ret = (exit_price / entry - 1.0) * d
-
-    hi = float(seg["high"].max())
-    lo = float(seg["low"].min())
+    hi = float(seg["high"].max()); lo = float(seg["low"].min())
     if d > 0:
-        mfe = (hi / entry - 1.0)
-        mae = (entry / lo - 1.0)
+        mfe = max(0.0, hi / entry - 1.0)
+        mae = max(0.0, entry / lo - 1.0)
     else:
-        mfe = (entry / lo - 1.0)
-        mae = (hi / entry - 1.0)
+        mfe = max(0.0, entry / lo - 1.0)
+        mae = max(0.0, hi / entry - 1.0)
     return ret, mfe, mae, exit_price
 
 async def compute_outcomes_sqlite_rows(venue: str, symbol: str, interval: str, lookback: int, store: SQLiteStore):
-    """Fetch klines, compute horizons for all signals of (venue,symbol,interval).
-       Upserts into SQLite and returns the computed rows for mirroring to Supabase."""
-    cls = SPOT.get(venue); ex = cls()
-    kl = await ex.fetch_klines(symbol, interval, lookback)
-    df = to_dataframe(kl)
-    if len(df) == 0:
-        return []
+    ex = SPOT[venue]()
+    df = to_dataframe(await ex.fetch_klines(symbol, interval, lookback))
+    if len(df) < 5: return []
 
     with store._conn() as con:
-        cur = con.execute(
+        rows = con.execute(
             "SELECT id, ts, side FROM signals WHERE venue=? AND symbol=? AND interval=? ORDER BY ts ASC",
             (venue, symbol, interval)
-        )
-        rows = cur.fetchall()
+        ).fetchall()
 
     out = []
+    step = 1 if interval.endswith("m") else 60
     for sid, ts_iso, side in rows:
         ts_ms = int(datetime.fromisoformat(ts_iso.replace("Z","+00:00")).timestamp() * 1000)
         i0 = _nearest_index(df, ts_ms)
-        if i0 < 0:
-            continue
-        entry = float(df.iloc[i0]["close"])
+        if i0 < 0: continue
+        i_entry = min(i0 + 1, len(df)-1)           # next-bar-open
+        entry = float(df.iloc[i_entry]["open"])
         for h in HORIZONS_MIN:
-            bars = h // (1 if interval.endswith("m") else 60)
-            ret, mfe, mae, exit_price = _calc_window(df, i0, bars, side, entry)
+            bars = max(1, h // step)
+            ret, mfe, mae, exit_price = _calc_window(df, i_entry, bars, side, entry)
             out.append({
                 "signal_id": int(sid),
                 "horizon_m": int(h),
@@ -81,6 +73,5 @@ async def compute_outcomes_sqlite_rows(venue: str, symbol: str, interval: str, l
                 "max_fav": float(mfe),
                 "max_adv": float(mae),
             })
-    # persist locally
     store.upsert_outcomes(out)
     return out
