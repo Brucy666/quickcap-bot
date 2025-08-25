@@ -1,29 +1,30 @@
+# app/executor.py
+from __future__ import annotations
+import time
+from dataclasses import dataclass
+from typing import Optional
 from app.logger import get_logger
-from app.config import load_settings
-from app.storage.supabase import Supa
 
 log = get_logger("executor")
 
+@dataclass
 class PaperExecutor:
-    def __init__(self, max_usdt: float):
-        self.max_usdt = max_usdt
+    max_pos_usdt: float = 1000.0
 
-    async def submit(self, symbol: str, side: str, price: float, score: float, reason: str):
-        log.info(f"[PAPER] {symbol} {side} @ {price:.4f} (score={score}) :: {reason}")
-
-        try:
-            cfg = load_settings()
-            if cfg.supabase_enabled and cfg.supabase_url and cfg.supabase_key:
-                supa = Supa(cfg.supabase_url, cfg.supabase_key)
-                # background logging (non‑blocking)
-                supa.log_execution_bg(
-                    venue="PAPER",
-                    symbol=symbol,
-                    side=side,
-                    price=price,
-                    score=score,
-                    reason=reason,
-                    is_paper=True,
-                )
-        except Exception as e:
-            log.error(f"Supabase log_execution error: {e}")
+    async def submit(self, symbol: str, side: str, price: float, score: float, reason: str) -> dict:
+        """
+        Paper 'execution' stub. Returns a record so callers can forward it to analytics/loggers.
+        """
+        ts = time.time()
+        rec = {
+            "ts": ts,
+            "venue": "PAPER",
+            "symbol": symbol,
+            "side": side.upper(),
+            "price": float(price),
+            "score": float(score),
+            "reason": reason,
+            "is_paper": True,
+        }
+        log.info(f"[PAPER] {rec['symbol']} {rec['side']} @ {rec['price']} (score={rec['score']}) :: {reason}")
+        return rec
