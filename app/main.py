@@ -1,9 +1,12 @@
+# app/main.py
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+
 import pandas as pd
 pd.set_option("future.no_silent_downcasting", True)
 
 import asyncio, time
+from datetime import datetime, timezone
 from typing import Dict, Tuple, List
 
 from app.config import load_settings
@@ -39,6 +42,9 @@ PERP_VENUES = {
     "bybit": (BybitSpotPublic, BybitPerpPublic),
 }
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 def _build_spot_exchanges(enabled: List[str]):
     return [(name, SPOT_ADAPTERS[name]()) for name in SPOT_ADAPTERS if name in enabled]
 
@@ -54,51 +60,58 @@ async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
     except Exception:
         return to_dataframe([])
 
-async def _process_symbol(cfg, supa, ex_name: str, ex, symbol: str, executor: PaperExecutor):
+async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str, executor: PaperExecutor):
     df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
-    if len(df) < 50:
+    if len(df) < 50 or cfg.risk_off:
         return
+
     sig = compute_signals(df)
     last = sig.iloc[-1].copy()
     last["score"] = float(score_row(last))
-    if cfg.risk_off:
-        return
 
     triggers: list[str] = []
     if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
     if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
     if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
 
-    if triggers and last["score"] >= cfg.alert_min_score:
-        now = time.time(); key = (ex_name, symbol)
-        if now - LAST_ALERT.get(key, 0) < cfg.alert_cooldown_sec:
-            return
-        LAST_ALERT[key] = now
-        side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
+    if not (triggers and last["score"] >= cfg.alert_min_score):
+        return
 
-        if supa:
-            supa.log_signal_bg(
+    now = time.time(); key = (ex_name, symbol)
+    if now - LAST_ALERT.get(key, 0) < cfg.alert_cooldown_sec:
+        return
+    LAST_ALERT[key] = now
+
+    side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
+    price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"]); score = float(last["score"])
+
+    # Mirror to Supabase (non-blocking) — only schema-valid columns
+    if supa:
+        asyncio.create_task(
+            supa.log_signal(
+                ts=_utc_now_iso(),
                 signal_type="spot",
                 venue=ex_name,
                 symbol=symbol,
                 interval=cfg.interval,
                 side=side,
-                price=float(last["close"]),
-                vwap=float(last["vwap"]),
-                rsi=float(last["rsi"]),
-                score=float(last["score"]),
+                price=price,
+                vwap=vwap,
+                rsi=rsi,
+                score=score,
                 triggers=triggers,
             )
-
-        await post_signal_embed(
-            cfg.discord_webhook,
-            exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
-            price=float(last["close"]), vwap=float(last["vwap"]), rsi=float(last["rsi"]),
-            score=float(last["score"]), triggers=triggers,
         )
-        await executor.submit(symbol, side, float(last["close"]), float(last["score"]), ", ".join(triggers))
 
-async def _spot_perp_for_symbol(cfg, supa, venue: str, symbol: str, executor):
+    # Discord + paper execution
+    await post_signal_embed(
+        cfg.discord_webhook,
+        exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
+        price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers,
+    )
+    await executor.submit(symbol, side, price, score, ", ".join(triggers))
+
+async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str, executor: PaperExecutor):
     pair = PERP_VENUES.get(venue)
     if not pair:
         return
@@ -113,28 +126,30 @@ async def _spot_perp_for_symbol(cfg, supa, venue: str, symbol: str, executor):
     side = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
     score = 2.0 + min(abs(sig["basis_z"]), 5.0)
 
+    # Only insert schema-valid columns into `signals`
     if supa:
-        supa.log_signal_bg(
-            signal_type="basis",
-            venue=venue,
-            symbol=symbol,
-            interval=cfg.interval,
-            side=side,
-            price=float(sig["spot_close"]),
-            vwap=float(sig["spot_vwap"]),
-            rsi=float(sig["spot_rsi"]),
-            score=float(score),
-            triggers=list(sig["triggers"]),
-            basis_pct=float(sig["basis_pct"]),
-            basis_z=float(sig["basis_z"]),
+        asyncio.create_task(
+            supa.log_signal(
+                ts=_utc_now_iso(),
+                signal_type="basis",
+                venue=venue,
+                symbol=symbol,
+                interval=cfg.interval,
+                side=side,
+                price=float(sig["spot_close"]),
+                vwap=float(sig["spot_vwap"]),
+                rsi=float(sig["spot_rsi"]),
+                score=float(score),
+                triggers=list(sig["triggers"]),
+            )
         )
 
     await post_signal_embed(
         cfg.discord_webhook,
         exchange=f"{venue}:BASIS", symbol=symbol, interval=cfg.interval, side=side,
-        price=sig["spot_close"], vwap=sig["spot_vwap"], rsi=sig["spot_rsi"],
-        score=score, triggers=sig["triggers"],
-        basis_pct=sig["basis_pct"], basis_z=sig["basis_z"],
+        price=float(sig["spot_close"]), vwap=float(sig["spot_vwap"]), rsi=float(sig["spot_rsi"]),
+        score=float(score), triggers=list(sig["triggers"]),
+        basis_pct=float(sig["basis_pct"]), basis_z=float(sig["basis_z"]),
     )
     await executor.submit(symbol, side, float(sig["spot_close"]), float(score), "Basis:" + ",".join(sig["triggers"]))
 
