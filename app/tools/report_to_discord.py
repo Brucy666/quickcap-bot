@@ -1,65 +1,124 @@
 # app/tools/report_to_discord.py
-import aiohttp
-import asyncio
-import json
-from app.logger import get_logger
+from __future__ import annotations
 
-log = get_logger("report_to_discord")
+import os, asyncio, aiohttp
+from collections import defaultdict
+from typing import Any, Dict, Iterable, Tuple, List
 
-# Map logical channels to Discord webhook URLs
-WEBHOOKS = {
-    "live": "https://discord.com/api/webhooks/1409631433865302217/BKWwGFqa7vK-l3V1sY5e5aGFq8x0LayqGDYrM6-0OE6xeQC8rFSqMfrAzUFxZeAA1bCJ",
-    "backfill": "https://discord.com/api/webhooks/1409631717311909919/wpoF7-XrwJ10eqpo0uo0apJha_nrHgL4iHvi2EWuLy3PFxle71V_sXBDN0tSKsfHaDQA",
-    "errors": "https://discord.com/api/webhooks/1409632131206086708/yTe-T1NcT72UFcY7i33ar-ZITVnrE6DbmPvWla8aek519TZhy--W3mERbH_Vd7z3XJn5",
-    "performance": "https://discord.com/api/webhooks/1409633072097529866/zT3fA34Exzbtn3oLn1-jFu-JY7IO_8cWoBrOxRvcTIZS5nZwUL-V22s5BQntyEsiKvag",
-}
+SUPABASE_URL  = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
+DISCORD_WEBHOOK = (
+    os.environ.get("DISCORD_WEBHOOK_PERFORMANCE", "").strip()
+    or os.environ.get("DISCORD_PERF_WEBHOOK", "").strip()
+)
 
-async def _post_message(webhook_url: str, content: str = None, embed: dict = None):
-    """Low-level function to post message or embed to Discord."""
-    async with aiohttp.ClientSession() as session:
-        payload = {}
-        if content:
-            payload["content"] = content
-        if embed:
-            payload["embeds"] = [embed]
-        try:
-            async with session.post(webhook_url, json=payload) as resp:
-                if resp.status != 204:
-                    txt = await resp.text()
-                    log.error(f"Discord webhook failed {resp.status}: {txt}")
-        except Exception as e:
-            log.exception(f"Discord webhook error: {e}")
+REPORT_SYMBOL  = os.environ.get("REPORT_SYMBOL", "").strip()
+REPORT_MIN_N   = int(os.environ.get("REPORT_MIN_N", "1"))
+REPORT_TOP     = int(os.environ.get("REPORT_TOP", "20"))
+REPORT_HORIZON = os.environ.get("REPORT_HORIZON", "").strip()
 
-# ---------- PUBLIC HELPERS ----------
+REST_BASE = f"{SUPABASE_URL}/rest/v1"
+HEADERS  = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
 
-async def post_signal_embed(channel: str, exchange: str, symbol: str, side: str,
-                            price: float, score: float, triggers: list, interval: str = "1m"):
-    """Send a trading signal embed to a Discord channel."""
-    if channel not in WEBHOOKS:
-        log.error(f"Unknown channel {channel}")
+# ---------- Supabase ----------
+async def fetch_all(table: str, select: str, where: Dict[str, str] | None = None, page: int = 10000):
+    rows: List[Dict[str, Any]] = []
+    start = 0
+    async with aiohttp.ClientSession() as sess:
+        while True:
+            params = {"select": select}
+            if where: params.update(where)
+            headers = dict(HEADERS)
+            headers["Range-Unit"] = "items"
+            headers["Range"] = f"{start}-{start+page-1}"
+            async with sess.get(f"{REST_BASE}/{table}", headers=headers, params=params) as r:
+                if r.status >= 400:
+                    raise RuntimeError(f"GET {table} {r.status}: {await r.text()}")
+                chunk = await r.json()
+                if not chunk: break
+                rows.extend(chunk)
+                if len(chunk) < page: break
+                start += page
+    return rows
+
+# ---------- Discord ----------
+async def post_embed(title: str, fields: List[dict], footer: str = ""):
+    if not DISCORD_WEBHOOK:
+        print(f"\n== {title} ==")
+        for f in fields: print(f"{f['name']}: {f['value']}")
         return
+    embed = {"title": title, "color": 0x5865F2, "fields": fields[:25]}
+    if footer: embed["footer"] = {"text": footer}
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(DISCORD_WEBHOOK, json={"embeds": [embed]}) as r:
+            if r.status >= 300:
+                raise RuntimeError(f"Discord post failed {r.status}: {await r.text()}")
 
-    embed = {
-        "title": f"📈 Signal on {exchange}:{symbol}",
-        "color": 0x00ff00 if side == "LONG" else 0xff0000,
-        "fields": [
-            {"name": "Side", "value": side, "inline": True},
-            {"name": "Price", "value": f"{price:.4f}", "inline": True},
-            {"name": "Score", "value": f"{score:.2f}", "inline": True},
-            {"name": "Triggers", "value": ", ".join(triggers), "inline": False},
-            {"name": "Interval", "value": interval, "inline": True},
-        ],
-    }
-    await _post_message(WEBHOOKS[channel], embed=embed)
+# ---------- Aggregation ----------
+def _h_filter(h: int) -> bool:
+    if not REPORT_HORIZON: return True
+    wanted = {int(x.strip()) for x in REPORT_HORIZON.split(",") if x.strip()}
+    return h in wanted
 
-async def post_backfill_summary(report_text: str):
-    """Send a backfill summary report to Discord."""
-    await _post_message(WEBHOOKS["backfill"], content=f"**Backfill Report**\n```{report_text}```")
+def summarize(rows: List[Dict[str, Any]]):
+    by_sym_h, by_trig_h, by_score_h = defaultdict(list), defaultdict(list), defaultdict(list)
+    for r in rows:
+        h = int(r.get("horizon_m") or 0)
+        if not _h_filter(h): continue
+        sym = str(r.get("symbol") or "")
+        by_sym_h[(sym, h)].append(r)
+        for t in (r.get("triggers") or []):
+            by_trig_h[(str(t), h)].append(r)
+        b = round(float(r.get("score") or 0.0), 1)
+        by_score_h[(b, h)].append(r)
 
-async def post_error(msg: str):
-    """Send error messages to Discord."""
-    await _post_message(WEBHOOKS["errors"], content=f"❌ Error:\n```{msg}```")
+    def agg(group):
+        out=[]
+        for key,lst in group.items():
+            n=len(lst)
+            if n<REPORT_MIN_N: continue
+            win=sum(1 for x in lst if float(x.get("ret") or 0.0)>0)/n
+            exp=sum(float(x.get("ret") or 0.0) for x in lst)/n
+            mfe=sum(float(x.get("max_fav") or 0.0) for x in lst)/n
+            mae=sum(float(x.get("max_adv") or 0.0) for x in lst)/n
+            out.append((key,n,win,exp,mfe,mae))
+        out.sort(key=lambda t:(t[3],t[1]), reverse=True)
+        return out[:REPORT_TOP]
+    return agg(by_sym_h), agg(by_trig_h), agg(by_score_h)
 
-async def post_performance_report(report_text: str):
-    """Send performance metrics to Discord."""
-    await _post_message(WEBHOOKS["performance"], content=f"**Sniper Performance Report**\n```{report_text}```")
+def pack_fields(rows: Iterable[Tuple[Tuple[Any,int], int, float, float, float, float]], key_hdr: str):
+    name_col=["Key","—"]; n_col=["n","—"]; win_col=["win","—"]; exp_col=["exp","—"]; mfe_col=["mfe","—"]; mae_col=["mae","—"]
+    for (key,n,win,exp,mfe,mae) in rows:
+        label = " | ".join(map(str,key)) if isinstance(key,tuple) else str(key)
+        name_col.append(label[:42]); n_col.append(str(n)); win_col.append(f"{win:0.2f}")
+        exp_col.append(f"{exp:0.6f}"); mfe_col.append(f"{mfe:0.6f}"); mae_col.append(f"{mae:0.6f}")
+    def block(lines): return "```\n" + "\n".join(lines) + "\n```"
+    return [
+        {"name":"Key", "value":block(name_col), "inline":True},
+        {"name":"n",   "value":block(n_col),   "inline":True},
+        {"name":"win", "value":block(win_col), "inline":True},
+        {"name":"exp", "value":block(exp_col), "inline":True},
+        {"name":"mfe", "value":block(mfe_col), "inline":True},
+        {"name":"mae", "value":block(mae_col), "inline":True},
+    ]
+
+# ---------- Main ----------
+async def main():
+    where = {"symbol": f"eq.{REPORT_SYMBOL}"} if REPORT_SYMBOL else None
+    rows = await fetch_all("v_signal_perf", select="symbol,horizon_m,score,ret,max_fav,max_adv,triggers", where=where)
+    if not rows:
+        await post_embed("Sniper Performance", [{"name":"Info","value":"_no rows in v_signal_perf_"}]); return
+
+    sym_rows, trig_rows, bucket_rows = summarize(rows)
+    footer = " • ".join(filter(None, [
+        f"symbol={REPORT_SYMBOL}" if REPORT_SYMBOL else "",
+        f"horizons={REPORT_HORIZON}" if REPORT_HORIZON else "",
+        f"min_n={REPORT_MIN_N}"
+    ]))
+
+    await post_embed("Sniper Performance • By Symbol × Horizon",      pack_fields(sym_rows,   "symbol | horizon"), footer)
+    await post_embed("Sniper Performance • By Trigger × Horizon",     pack_fields(trig_rows,  "trigger | horizon"), footer)
+    await post_embed("Sniper Performance • By Score Bucket × Horizon",pack_fields(bucket_rows,"score~ | horizon"), footer)
+
+if __name__ == "__main__":
+    asyncio.run(main())
