@@ -60,6 +60,20 @@ async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
     except Exception:
         return to_dataframe([])
 
+async def _log_signal_and_exec_to_supa(
+    supa: Supa | None,
+    signal_payload: dict,
+    exec_payload: dict | None = None,
+):
+    if not supa:
+        return
+    try:
+        asyncio.create_task(supa.log_signal(**signal_payload))
+        if exec_payload:
+            asyncio.create_task(supa.log_execution(**exec_payload))
+    except Exception as e:
+        log.error(f"Supabase log error: {e}")
+
 async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str, executor: PaperExecutor):
     df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
     if len(df) < 50 or cfg.risk_off:
@@ -85,31 +99,43 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
     price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"]); score = float(last["score"])
 
-    # Mirror to Supabase (non-blocking) — only schema-valid columns
-    if supa:
-        asyncio.create_task(
-            supa.log_signal(
-                ts=_utc_now_iso(),
-                signal_type="spot",
-                venue=ex_name,
-                symbol=symbol,
-                interval=cfg.interval,
-                side=side,
-                price=price,
-                vwap=vwap,
-                rsi=rsi,
-                score=score,
-                triggers=triggers,
-            )
-        )
+    # Build signal payload (UTC)
+    signal_row = {
+        "ts": _utc_now_iso(),
+        "signal_type": "spot",
+        "venue": ex_name,
+        "symbol": symbol,
+        "interval": cfg.interval,
+        "side": side,
+        "price": price,
+        "vwap": vwap,
+        "rsi": rsi,
+        "score": score,
+        "triggers": triggers,
+    }
 
-    # Discord + paper execution
+    # Discord alert
     await post_signal_embed(
         cfg.discord_webhook,
         exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
         price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers,
     )
-    await executor.submit(symbol, side, price, score, ", ".join(triggers))
+
+    # Paper execution + build exec payload
+    exec_rec = await executor.submit(symbol, side, price, score, ", ".join(triggers))
+    exec_row = {
+        "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
+        "venue": exec_rec["venue"],
+        "symbol": exec_rec["symbol"],
+        "side": exec_rec["side"],
+        "price": exec_rec["price"],
+        "score": exec_rec["score"],
+        "reason": exec_rec["reason"],
+        "is_paper": exec_rec["is_paper"],
+    }
+
+    # Non-blocking Supabase writes
+    await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str, executor: PaperExecutor):
     pair = PERP_VENUES.get(venue)
@@ -126,23 +152,20 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     side = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
     score = 2.0 + min(abs(sig["basis_z"]), 5.0)
 
-    # Only insert schema-valid columns into `signals`
-    if supa:
-        asyncio.create_task(
-            supa.log_signal(
-                ts=_utc_now_iso(),
-                signal_type="basis",
-                venue=venue,
-                symbol=symbol,
-                interval=cfg.interval,
-                side=side,
-                price=float(sig["spot_close"]),
-                vwap=float(sig["spot_vwap"]),
-                rsi=float(sig["spot_rsi"]),
-                score=float(score),
-                triggers=list(sig["triggers"]),
-            )
-        )
+    # Build signal payload (note: we only write fields that exist in `signals`)
+    signal_row = {
+        "ts": _utc_now_iso(),
+        "signal_type": "basis",
+        "venue": venue,
+        "symbol": symbol,
+        "interval": cfg.interval,
+        "side": side,
+        "price": float(sig["spot_close"]),
+        "vwap": float(sig["spot_vwap"]),
+        "rsi": float(sig["spot_rsi"]),
+        "score": float(score),
+        "triggers": list(sig["triggers"]),
+    }
 
     await post_signal_embed(
         cfg.discord_webhook,
@@ -151,7 +174,20 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         score=float(score), triggers=list(sig["triggers"]),
         basis_pct=float(sig["basis_pct"]), basis_z=float(sig["basis_z"]),
     )
-    await executor.submit(symbol, side, float(sig["spot_close"]), float(score), "Basis:" + ",".join(sig["triggers"]))
+
+    exec_rec = await executor.submit(symbol, side, float(sig["spot_close"]), float(score), "Basis:" + ",".join(sig["triggers"]))
+    exec_row = {
+        "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
+        "venue": exec_rec["venue"],
+        "symbol": exec_rec["symbol"],
+        "side": exec_rec["side"],
+        "price": exec_rec["price"],
+        "score": exec_rec["score"],
+        "reason": exec_rec["reason"],
+        "is_paper": exec_rec["is_paper"],
+    }
+
+    await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 async def scan_once():
     cfg = load_settings()
