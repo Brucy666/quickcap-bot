@@ -1,12 +1,13 @@
-# app/notifier.py
 from __future__ import annotations
 import os, aiohttp
 from typing import Iterable, Optional
 
+# Webhooks come from ENV vars
 WEBHOOK_LIVE        = os.getenv("DISCORD_WEBHOOK_LIVE",        "").strip()
 WEBHOOK_BACKFILL    = os.getenv("DISCORD_WEBHOOK_BACKFILL",    "").strip()
 WEBHOOK_ERRORS      = os.getenv("DISCORD_WEBHOOK_ERRORS",      "").strip()
 WEBHOOK_PERFORMANCE = os.getenv("DISCORD_WEBHOOK_PERFORMANCE", "").strip()
+
 
 def _side_color(side: str) -> int:
     return 0x13A10E if (side or "").upper() == "LONG" else 0xC50F1F
@@ -14,6 +15,7 @@ def _side_color(side: str) -> int:
 def _fmt_trigs(trigs: Iterable[str]) -> str:
     t = [str(x) for x in (trigs or []) if str(x).strip()]
     return " • ".join(t) if t else "—"
+
 
 class DiscordNotifier:
     def __init__(self):
@@ -37,13 +39,13 @@ class DiscordNotifier:
             print(f"[NOTIFY] {e}")
 
     # --- public APIs ---
-
     async def signal_embed(
         self, *, exchange: str, symbol: str, interval: str, side: str,
         price: float, vwap: float, rsi: float, score: float,
         triggers: Iterable[str], basis_pct: Optional[float]=None, basis_z: Optional[float]=None
     ):
-        if not WEBHOOK_LIVE: return
+        if not WEBHOOK_LIVE:
+            return
         fields = [
             {"name": "Side", "value": side, "inline": True},
             {"name": "Interval", "value": interval, "inline": True},
@@ -67,7 +69,8 @@ class DiscordNotifier:
 
     async def backfill_summary(self, venue: str, symbol: str, interval: str,
                                signals: int, executions: int, outcomes: int):
-        if not WEBHOOK_BACKFILL: return
+        if not WEBHOOK_BACKFILL:
+            return
         msg = f"✅ **Backfill** `{venue}:{symbol}:{interval}` → signals={signals} • executions={executions} • outcomes={outcomes}"
         await self._post(WEBHOOK_BACKFILL, {"content": msg[:1990]})
 
@@ -79,4 +82,6 @@ class DiscordNotifier:
         if WEBHOOK_ERRORS:
             await self._post(WEBHOOK_ERRORS, {"content": f"⚠️ **Error:** {msg}"[:1990]})
 
+
+# Global singleton
 NOTIFY = DiscordNotifier()
