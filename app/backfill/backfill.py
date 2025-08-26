@@ -31,10 +31,12 @@ SPOT = {
     "bybit": BybitSpotPublic,
 }
 
+
 # -------------------- helpers --------------------
 
 def _iso_utc(ts: float | int) -> str:
     return datetime.utcfromtimestamp(float(ts)).replace(tzinfo=timezone.utc).isoformat()
+
 
 async def _fetch_df(ex_cls, symbol: str, interval: str, lookback: int) -> pd.DataFrame:
     """
@@ -52,6 +54,7 @@ async def _fetch_df(ex_cls, symbol: str, interval: str, lookback: int) -> pd.Dat
         df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
     return df.reset_index(drop=True)
 
+
 # -------------------- core backfill --------------------
 
 async def backfill_symbol(
@@ -66,6 +69,7 @@ async def backfill_symbol(
 ) -> Dict[str, int]:
     """
     Replays signals on historical bars (no lookahead) and logs signals/executions/outcomes.
+    Outcomes are stored in SQLite ONLY (no Supabase write) to avoid FK/schema issues.
     Returns counts for summary.
     """
     if venue not in SPOT:
@@ -84,17 +88,19 @@ async def backfill_symbol(
     last_alert_ts = 0.0
     sig_ct = exe_ct = 0
 
-    # indicator warmup
+    # replay through time (use up to bar i to compute signal for bar i)
+    # start with a buffer so indicators warm up
     start_i = max(50, min(200, n // 50))
     for i in range(start_i, n - 1):
         window = df.iloc[: i + 1].copy()
         sig = compute_signals(window)
         last = sig.iloc[-1].copy()
 
+        # score with improved function
         last_score = float(score_row(last))
         last["score"] = last_score
 
-        # Build triggers list for display/audit
+        # triggers for display/audit
         triggers: List[str] = []
         if last.get("sweep_long"):   triggers.append("VWAP Sweep Long")
         if last.get("sweep_short"):  triggers.append("VWAP Sweep Short")
@@ -102,7 +108,7 @@ async def backfill_symbol(
         if last.get("bear_div"):     triggers.append("Bear Div")
         if last.get("mom_pop"):      triggers.append("Momentum Pop")
 
-        # Quality gates
+        # gates
         if not triggers:
             continue
         if last_score < min_score:
@@ -115,36 +121,31 @@ async def backfill_symbol(
         if last.get("sweep_long") or last.get("bull_div"):
             side = "LONG"
 
-        # cooldown to avoid signal spam
-        ts_val = window["ts"].iloc[-1]
-        now_ts = ts_val.timestamp() if hasattr(ts_val, "timestamp") else float(ts_val)
+        # cooldown (per-symbol)
+        now_ts = window["ts"].iloc[-1].timestamp() if hasattr(window["ts"].iloc[-1], "timestamp") else float(window["ts"].iloc[-1])
         if now_ts - last_alert_ts < cooldown_sec:
             continue
         last_alert_ts = now_ts
 
-        ts_iso = _iso_utc(now_ts)
-        signal_key = f"{venue}:{norm_symbol}:{ts_iso}"
-
         # ---- log signal
         sig_row = {
-            "ts": ts_iso,
+            "ts": _iso_utc(now_ts),
             "signal_type": "spot",
             "venue": venue,
             "symbol": norm_symbol,
             "interval": interval,
             "side": side,
             "price": float(last.get("close", window["close"].iloc[-1])),
-            "vwap": float(last.get("vwap", (window["vwap"] if "vwap" in window else window["close"]).iloc[-1])),
+            "vwap": float(last.get("vwap", window.get("vwap", window["close"]).iloc[-1])),
             "rsi": float(last.get("rsi", 0.0)),
             "score": last_score,
             "triggers": triggers,
-            "signal_key": signal_key,        # <<< stable join key for outcomes
         }
         store.insert_signal(sig_row)
         sig_ct += 1
         if supa:
-            # supabase client is sync; call directly (no create_task)
-            supa.log_signal(**sig_row)
+            # fire-and-forget
+            asyncio.create_task(supa.log_signal(**sig_row))
 
         # ---- naive execution on next bar open (paper)
         nxt = df.iloc[i + 1]
@@ -162,41 +163,12 @@ async def backfill_symbol(
         store.insert_execution(exec_row)
         exe_ct += 1
         if supa:
-            supa.log_execution(**exec_row)
+            asyncio.create_task(supa.log_execution(**exec_row))
 
-    # ---- outcomes
-    # compute from sqlite; attach signal_key so we can upsert safely in Supabase
-    raw_out = await compute_outcomes_sqlite_rows(venue, norm_symbol, interval, lookback, store)
-    sb_rows: List[Dict[str, object]] = []
-
-    for o in raw_out or []:
-        # Prefer a direct key if present, otherwise synthesize from signal ts
-        if "signal_key" in o and o["signal_key"]:
-            key = o["signal_key"]
-        elif "signal_ts_iso" in o and o["signal_ts_iso"]:
-            key = f"{venue}:{norm_symbol}:{o['signal_ts_iso']}"
-        elif "signal_ts" in o and o["signal_ts"]:
-            key = f"{venue}:{norm_symbol}:{_iso_utc(o['signal_ts'])}"
-        else:
-            # cannot guarantee FK → skip this row
-            continue
-
-        sb_rows.append({
-            "signal_key": key,
-            "horizon_m": int(o["horizon_m"]),
-            "win": bool(o["win"]),
-            "exp": float(o["exp"]),
-            "mfe": float(o["mfe"]),
-            "mae": float(o["mae"]),
-        })
-
-    out_ct = len(sb_rows)
-    if supa and out_ct:
-        try:
-            # upsert on (signal_key, horizon_m) to avoid FK errors and dupes
-            supa.bulk_insert("signal_outcomes", sb_rows, on_conflict="signal_key,horizon_m")
-        except Exception as e:
-            print(f"[WARN] supa.bulk_insert(signal_outcomes): {e}")
+    # ---- outcomes (SQLite only)
+    out_rows = await compute_outcomes_sqlite_rows(venue, norm_symbol, interval, lookback, store)
+    out_ct = len(out_rows)
+    print(f"[OUTCOMES] stored {out_ct} rows in SQLite (skipped Supabase upload)")
 
     print(f"[BACKFILL] {venue}:{norm_symbol}:{interval} -> signals={sig_ct} executions={exe_ct} outcomes={out_ct}")
 
@@ -207,6 +179,7 @@ async def backfill_symbol(
         print(f"[WARN] backfill summary discord: {e}")
 
     return {"signals": sig_ct, "executions": exe_ct, "outcomes": out_ct}
+
 
 # -------------------- CLI runner --------------------
 
@@ -243,6 +216,7 @@ async def _worker(
             totals[k] += r.get(k, 0)
     return totals
 
+
 async def main():
     p = argparse.ArgumentParser(
         description="QuickCap historical backfill (spot)",
@@ -257,11 +231,12 @@ async def main():
     p.add_argument("--sqlite", default="quickcap_results.db")
     p.add_argument("--concurrency", type=int, default=4)
 
-    # Be tolerant of unknown flags (so old scripts like --basis-z-th won't crash)
+    # tolerate unknown flags (compat with older scripts)
     args, _unknown = p.parse_known_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     cfg = load_settings()
+
     supa = None
     try:
         if getattr(cfg, "supabase_enabled", False):
@@ -288,6 +263,7 @@ async def main():
     )
 
     print(json.dumps(totals, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     try:
