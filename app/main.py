@@ -19,7 +19,7 @@ from app.executor import PaperExecutor
 from app.notifier import post_signal_embed
 from app.alpha.spot_perp_engine import compute_basis_signals
 from app.storage.supabase import Supa
-from app.policy import POLICY  # <<< NEW: central trade filter
+from app.policy import POLICY   # central trade filter
 
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
@@ -79,7 +79,7 @@ def _build_ctx(strategy: str, venue: str, symbol: str, interval: str, side: str,
                price: float, vwap: float, rsi: float, score: float,
                triggers: List[str], extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
     ctx = {
-        "strategy": strategy,          # "spot" | "basis"
+        "signal_type": strategy,   # "spot" | "basis"
         "venue": venue,
         "symbol": symbol,
         "interval": interval,
@@ -90,6 +90,7 @@ def _build_ctx(strategy: str, venue: str, symbol: str, interval: str, side: str,
         "score": score,
         "triggers": list(triggers or []),
         "ts": _utc_now_iso(),
+        "close": price,  # include close for VWAP distance calc
     }
     if extra:
         ctx.update(extra)
@@ -104,23 +105,20 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     last = sig.iloc[-1].copy()
     last["score"] = float(score_row(last))
 
-    # trigger synthesis
-    triggers: List[str] = []
+    triggers: list[str] = []
     if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
     if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
     if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
 
-    score = float(last["score"])
-    if not (triggers and score >= cfg.alert_min_score):
+    if not (triggers and last["score"] >= cfg.alert_min_score):
         return
 
-    # Cooldown per (venue, symbol)
     now = time.time(); key = (ex_name, symbol)
     if now - LAST_ALERT.get(key, 0) < cfg.alert_cooldown_sec:
         return
 
     side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
-    price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"])
+    price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"]); score = float(last["score"])
 
     # ---------- POLICY GATE ----------
     ctx = _build_ctx(
@@ -128,13 +126,12 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         venue=ex_name, symbol=symbol, interval=str(cfg.interval), side=side,
         price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers
     )
-    if not POLICY.should_trade(ctx):
-        return  # filtered out (duplicate, flip, low score, wrong trigger, etc.)
+    if not POLICY.should_trade(**ctx):   # ✅ fixed (unpack dict as kwargs)
+        return
     # ---------------------------------
 
-    LAST_ALERT[key] = now  # only start cooldown once policy OK'd it
+    LAST_ALERT[key] = now
 
-    # Build signal payload (UTC)
     signal_row = {
         "ts": _utc_now_iso(),
         "signal_type": "spot",
@@ -149,14 +146,12 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         "triggers": triggers,
     }
 
-    # Discord alert
     await post_signal_embed(
         cfg.discord_webhook,
         exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
         price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers,
     )
 
-    # Paper execution + build exec payload
     exec_rec = await executor.submit(symbol, side, price, score, ", ".join(triggers))
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
@@ -169,7 +164,6 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         "is_paper": exec_rec["is_paper"],
     }
 
-    # Non-blocking Supabase writes
     await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str, executor: PaperExecutor):
@@ -193,16 +187,12 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         venue=venue, symbol=symbol, interval=str(cfg.interval), side=side,
         price=float(sig["spot_close"]), vwap=float(sig["spot_vwap"]), rsi=float(sig["spot_rsi"]),
         score=float(score), triggers=list(sig["triggers"]),
-        extra={
-            "basis_pct": float(sig["basis_pct"]),
-            "basis_z": float(sig["basis_z"]),
-        }
+        extra={"basis_pct": float(sig["basis_pct"]), "basis_z": float(sig["basis_z"])}
     )
-    if not POLICY.should_trade(ctx):
+    if not POLICY.should_trade(**ctx):   # ✅ fixed (unpack dict as kwargs)
         return
     # ---------------------------------
 
-    # Build signal payload
     signal_row = {
         "ts": _utc_now_iso(),
         "signal_type": "basis",
