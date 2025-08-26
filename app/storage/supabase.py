@@ -3,134 +3,94 @@ from __future__ import annotations
 
 import aiohttp
 import json
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, List, Optional
+
 
 class Supa:
     """
-    Minimal Supabase REST client (PostgREST).
-    - signals: upsert on (venue,symbol,interval,ts)
-    - executions: plain insert (no on_conflict required)
-    - ignores duplicate / 409 errors gracefully
-    - single shared aiohttp session
+    Minimal, resilient Supabase REST client for logging signals/executions/outcomes.
+    - Reuses a single aiohttp session
+    - Throws clear errors when REST says 4xx/5xx
+    - Only sends known columns
     """
 
-    def __init__(self, url: str, key: str, schema: str = "public", timeout: int = 15) -> None:
-        if not url or not key:
-            raise ValueError("Supabase URL/Key required")
-        base = url.rstrip("/")
-        if not base.endswith("/rest/v1"):
-            base = f"{base}/rest/v1"
-        self.base = base
+    def __init__(self, url: str, key: str):
+        self.url = url.rstrip("/")
         self.key = key
-        self.schema = schema
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
 
-        self._base_headers = {
-            "apikey": self.key,
-            "Authorization": f"Bearer {self.key}",
+        # Static headers for REST
+        self._headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            "Accept-Profile": self.schema,
+            # Return minimal body to reduce bandwidth
+            "Prefer": "return=minimal",
         }
 
-    # ---------- session ----------
+    # ---------- session lifecycle ----------
 
-    async def _session(self) -> aiohttp.ClientSession:
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """
+        Guarantee we have an open aiohttp session.
+        (Fixes the 'NoneType is not callable' crash you saw.)
+        """
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self.timeout)
+            self._session = aiohttp.ClientSession(headers=self._headers)
         return self._session
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        s = self._session
+        if s and not s.closed:
+            await s.close()
+        self._session = None
 
-    # ---------- HTTP helpers ----------
+    # ---------- core REST helpers ----------
 
-    async def _post(
-        self,
-        table: str,
-        rows: Iterable[Dict[str, Any]],
-        *,
-        prefer: str = "return=minimal",
-        on_conflict: Optional[str] = None,
-    ) -> None:
-        sess = await self._session()
-        url = f"{self.base}/{table}"
-        if on_conflict:
-            url = f"{url}?on_conflict={on_conflict}"
+    async def _post_rows(self, table: str, rows: List[Dict[str, Any]]) -> None:
+        """
+        Insert a list of rows using Supabase REST bulk endpoint (row-by-row JSON).
+        We send only fields present in each row — Supabase will ignore missing columns.
+        """
+        if not rows:
+            return
 
-        headers = dict(self._base_headers)
-        headers["Prefer"] = prefer
+        s = await self._ensure_session()
+        url = f"{self.url}/rest/v1/{table}"
+        # Supabase REST accepts an array of JSON objects for bulk insert.
+        payload = json.dumps(rows)
 
-        payload = json.dumps(list(rows), ensure_ascii=False)
-        async with sess.post(url, data=payload, headers=headers) as resp:
-            if resp.status in (200, 201, 204):
-                return
-            if resp.status == 409:
-                # duplicate / conflict – OK to ignore for idempotency
-                return
-            txt = await resp.text()
-            raise RuntimeError(f"Supabase POST {table} failed [{resp.status}]: {txt}")
+        async with s.post(url, data=payload) as r:
+            if r.status >= 300:
+                txt = await r.text()
+                raise RuntimeError(f"Supabase POST {table} failed [{r.status}]: {txt}")
 
-    # ---------- shaping ----------
+    # ---------- public logging API ----------
 
-    @staticmethod
-    def _shape_signal(row: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(row)
+    # NOTE: We **whitelist** safe columns to avoid “missing column” schema errors.
+    _SIGNAL_COLS = {
+        "ts", "signal_type", "venue", "symbol", "interval",
+        "side", "price", "vwap", "rsi", "score", "triggers"
+    }
+    _EXEC_COLS = {
+        "ts", "venue", "symbol", "side", "price", "score", "reason", "is_paper"
+    }
 
-        # Ensure 'close' column exists (some schemas require it)
-        if "close" not in out and "price" in out:
-            out["close"] = out["price"]
-
-        # Normalize triggers -> list
-        tr = out.get("triggers")
-        if tr is None:
-            out["triggers"] = []
-        elif isinstance(tr, str):
-            out["triggers"] = [t.strip() for t in tr.split(",") if t.strip()]
-        elif isinstance(tr, (list, tuple)):
-            out["triggers"] = list(tr)
-        else:
-            out["triggers"] = [str(tr)]
-
-        # Your 'signals' table does NOT have these columns — strip them always
-        out.pop("basis_pct", None)
-        out.pop("basis_z", None)
-
+    def _project(self, row: Dict[str, Any], allowed: set[str]) -> Dict[str, Any]:
+        # Keep only allowed keys and coerce 'triggers' list -> JSON string for safety
+        out = {k: row[k] for k in row.keys() & allowed}
+        if "triggers" in out and isinstance(out["triggers"], list):
+            out["triggers"] = json.dumps(out["triggers"])
         return out
 
-    # ---------- public API ----------
+    async def log_signal(self, **fields) -> None:
+        row = self._project(fields, self._SIGNAL_COLS)
+        await self._post_rows("signals", [row])
 
-    async def log_signal(self, **row: Any) -> None:
-        shaped = self._shape_signal(row)
-        # proper upsert on signals unique key
-        await self._post(
-            "signals",
-            [shaped],
-            prefer="resolution=merge-duplicates,return=minimal",
-            on_conflict="venue,symbol,interval,ts",
-        )
+    async def log_execution(self, **fields) -> None:
+        row = self._project(fields, self._EXEC_COLS)
+        await self._post_rows("executions", [row])
 
-    async def log_execution(self, **row: Any) -> None:
-        # plain insert (no on_conflict; your table lacks a matching unique index)
-        await self._post(
-            "executions",
-            [row],
-            prefer="return=minimal",
-            on_conflict=None,
-        )
-
-    async def bulk_insert(
-        self,
-        table: str,
-        rows: Iterable[Dict[str, Any]],
-        *,
-        on_conflict: Optional[str] = None,
-        prefer_return: str = "minimal",
-    ) -> None:
-        await self._post(
-            table,
-            rows,
-            prefer=f"return={prefer_return}" if not on_conflict else f"resolution=merge-duplicates,return={prefer_return}",
-            on_conflict=on_conflict,
-        )
+    async def bulk_insert(self, table: str, rows: List[Dict[str, Any]], on_conflict: str = "") -> None:
+        # Generic bulk insert — used for outcomes. Don’t assume any schema.
+        await self._post_rows(table, rows)
