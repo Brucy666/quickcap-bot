@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import argparse
 import json
-import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -32,7 +31,6 @@ SPOT = {
     "bybit": BybitSpotPublic,
 }
 
-
 # -------------------- helpers --------------------
 
 def _iso_utc(ts: float | int) -> str:
@@ -53,7 +51,6 @@ async def _fetch_df(ex_cls, symbol: str, interval: str, lookback: int) -> pd.Dat
     if "close" in df:
         df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
     return df.reset_index(drop=True)
-
 
 # -------------------- core backfill --------------------
 
@@ -87,15 +84,13 @@ async def backfill_symbol(
     last_alert_ts = 0.0
     sig_ct = exe_ct = 0
 
-    # replay through time (use up to bar i to compute signal for bar i)
-    # start with a buffer so indicators warm up
+    # indicator warmup
     start_i = max(50, min(200, n // 50))
     for i in range(start_i, n - 1):
         window = df.iloc[: i + 1].copy()
         sig = compute_signals(window)
         last = sig.iloc[-1].copy()
 
-        # score with your improved function
         last_score = float(score_row(last))
         last["score"] = last_score
 
@@ -113,7 +108,7 @@ async def backfill_symbol(
         if last_score < min_score:
             continue
 
-        # simple side heuristic: prefer sweep/div; else infer from divergences
+        # side heuristic
         side = "LONG"
         if last.get("sweep_short") or last.get("bear_div"):
             side = "SHORT"
@@ -121,29 +116,35 @@ async def backfill_symbol(
             side = "LONG"
 
         # cooldown to avoid signal spam
-        now_ts = window["ts"].iloc[-1].timestamp() if hasattr(window["ts"].iloc[-1], "timestamp") else float(window["ts"].iloc[-1])
+        ts_val = window["ts"].iloc[-1]
+        now_ts = ts_val.timestamp() if hasattr(ts_val, "timestamp") else float(ts_val)
         if now_ts - last_alert_ts < cooldown_sec:
             continue
         last_alert_ts = now_ts
 
+        ts_iso = _iso_utc(now_ts)
+        signal_key = f"{venue}:{norm_symbol}:{ts_iso}"
+
         # ---- log signal
         sig_row = {
-            "ts": _iso_utc(now_ts),
+            "ts": ts_iso,
             "signal_type": "spot",
             "venue": venue,
             "symbol": norm_symbol,
             "interval": interval,
             "side": side,
             "price": float(last.get("close", window["close"].iloc[-1])),
-            "vwap": float(last.get("vwap", window.get("vwap", window["close"]).iloc[-1])),
+            "vwap": float(last.get("vwap", (window["vwap"] if "vwap" in window else window["close"]).iloc[-1])),
             "rsi": float(last.get("rsi", 0.0)),
             "score": last_score,
             "triggers": triggers,
+            "signal_key": signal_key,        # <<< stable join key for outcomes
         }
         store.insert_signal(sig_row)
         sig_ct += 1
         if supa:
-            asyncio.create_task(supa.log_signal(**sig_row))
+            # supabase client is sync; call directly (no create_task)
+            supa.log_signal(**sig_row)
 
         # ---- naive execution on next bar open (paper)
         nxt = df.iloc[i + 1]
@@ -161,14 +162,39 @@ async def backfill_symbol(
         store.insert_execution(exec_row)
         exe_ct += 1
         if supa:
-            asyncio.create_task(supa.log_execution(**exec_row))
+            supa.log_execution(**exec_row)
 
     # ---- outcomes
-    out_rows = await compute_outcomes_sqlite_rows(venue, norm_symbol, interval, lookback, store)
-    out_ct = len(out_rows)
+    # compute from sqlite; attach signal_key so we can upsert safely in Supabase
+    raw_out = await compute_outcomes_sqlite_rows(venue, norm_symbol, interval, lookback, store)
+    sb_rows: List[Dict[str, object]] = []
+
+    for o in raw_out or []:
+        # Prefer a direct key if present, otherwise synthesize from signal ts
+        if "signal_key" in o and o["signal_key"]:
+            key = o["signal_key"]
+        elif "signal_ts_iso" in o and o["signal_ts_iso"]:
+            key = f"{venue}:{norm_symbol}:{o['signal_ts_iso']}"
+        elif "signal_ts" in o and o["signal_ts"]:
+            key = f"{venue}:{norm_symbol}:{_iso_utc(o['signal_ts'])}"
+        else:
+            # cannot guarantee FK → skip this row
+            continue
+
+        sb_rows.append({
+            "signal_key": key,
+            "horizon_m": int(o["horizon_m"]),
+            "win": bool(o["win"]),
+            "exp": float(o["exp"]),
+            "mfe": float(o["mfe"]),
+            "mae": float(o["mae"]),
+        })
+
+    out_ct = len(sb_rows)
     if supa and out_ct:
         try:
-            await supa.bulk_insert("signal_outcomes", out_rows, on_conflict="signal_id,horizon_m")
+            # upsert on (signal_key, horizon_m) to avoid FK errors and dupes
+            supa.bulk_insert("signal_outcomes", sb_rows, on_conflict="signal_key,horizon_m")
         except Exception as e:
             print(f"[WARN] supa.bulk_insert(signal_outcomes): {e}")
 
@@ -181,7 +207,6 @@ async def backfill_symbol(
         print(f"[WARN] backfill summary discord: {e}")
 
     return {"signals": sig_ct, "executions": exe_ct, "outcomes": out_ct}
-
 
 # -------------------- CLI runner --------------------
 
@@ -217,7 +242,6 @@ async def _worker(
         for k in totals:
             totals[k] += r.get(k, 0)
     return totals
-
 
 async def main():
     p = argparse.ArgumentParser(
@@ -264,10 +288,6 @@ async def main():
     )
 
     print(json.dumps(totals, ensure_ascii=False))
-
-    # (Optional) trigger performance report step here if you have a runner script
-    # You can leave this out if you prefer running performance separately.
-
 
 if __name__ == "__main__":
     try:
