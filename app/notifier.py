@@ -1,173 +1,105 @@
 # app/notifier.py
 from __future__ import annotations
-
 import os
-from datetime import datetime, timezone
-from typing import Iterable, Mapping, Any, Optional
-
 import aiohttp
+import asyncio
+from datetime import datetime, timezone
+from typing import Iterable, Optional
 
-# ----------------------------
-# Discord webhooks (ENV first)
-# ----------------------------
+# ---- Webhook URLs from ENV or defaults ----
 WEBHOOK_LIVE        = os.getenv("DISCORD_WEBHOOK_LIVE",        "").strip()
 WEBHOOK_BACKFILL    = os.getenv("DISCORD_WEBHOOK_BACKFILL",    "").strip()
 WEBHOOK_ERRORS      = os.getenv("DISCORD_WEBHOOK_ERRORS",      "").strip()
 WEBHOOK_PERFORMANCE = os.getenv("DISCORD_WEBHOOK_PERFORMANCE", "").strip()
 
-
-# ----------------------------
-# Small utilities
-# ----------------------------
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _join_triggers(trigs: Optional[Iterable[str]]) -> str:
-    if not trigs:
-        return "—"
-    items = [str(t).strip() for t in trigs if str(t).strip()]
-    return " • ".join(items) if items else "—"
+def _fmt_triggers(trigs: Iterable[str]) -> str:
+    if not trigs: return "—"
+    return " • ".join([str(x) for x in trigs if str(x).strip()])
 
 def _side_color(side: str) -> int:
-    # green long / red short
     return 0x13A10E if (side or "").upper() == "LONG" else 0xC50F1F
 
-async def _post_json(url: str, payload: Mapping[str, Any]) -> None:
-    """
-    Fire-and-forget style post to a Discord webhook.
-    Creates a short-lived session per call (keeps the code simple/safe).
-    """
-    if not url:
-        # Running without a webhook is fine in dev; just skip silently.
-        return
-    async with aiohttp.ClientSession() as s:
-        async with s.post(url, json=payload) as r:
-            if r.status >= 300:
-                txt = await r.text()
-                raise RuntimeError(f"Discord post failed {r.status}: {txt}")
+
+# ----------------- SESSION HANDLER -----------------
+class DiscordNotifier:
+    """Singleton async session wrapper for Discord webhooks"""
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def post(self, url: str, payload: dict):
+        if not url:
+            return
+        try:
+            session = await self._ensure_session()
+            async with session.post(url, json=payload) as r:
+                if r.status >= 300:
+                    txt = await r.text()
+                    print(f"[DISCORD] Failed {r.status}: {txt}")
+        except Exception as e:
+            print(f"[DISCORD] Error posting: {e}")
 
 
-# ----------------------------
-# Public low-level senders
-# ----------------------------
+NOTIFY = DiscordNotifier()  # global singleton
+
+
+# ----------------- PUBLIC API -----------------
+
 async def post_signal_embed(
-    _unused: Optional[str] = None,  # kept for backwards compatibility (used to pass a webhook)
-    *,
     exchange: str,
     symbol: str,
-    interval: str = "1m",
+    interval: str,
     side: str,
     price: float,
-    vwap: Optional[float] = None,
-    rsi: Optional[float] = None,
-    score: Optional[float] = None,
-    triggers: Optional[Iterable[str]] = None,
-    # optional basis fields (when you send BASIS alerts)
-    basis_pct: Optional[float] = None,
-    basis_z: Optional[float] = None,
-) -> None:
-    """
-    Send a live signal embed to #sniper-live (or your WEBHOOK_LIVE).
-    """
-    title = f"{symbol} • {side.upper()}"
-    description = _join_triggers(triggers)
-
-    fields = [
-        {"name": "Exchange", "value": str(exchange), "inline": True},
-        {"name": "Interval", "value": str(interval), "inline": True},
-    ]
-
-    if price is not None:
-        fields.append({"name": "Price", "value": f"{price}", "inline": True})
-    if vwap is not None:
-        fields.append({"name": "VWAP", "value": f"{vwap}", "inline": True})
-    if rsi is not None:
-        fields.append({"name": "RSI", "value": f"{rsi}", "inline": True})
-    if score is not None:
-        fields.append({"name": "Score", "value": f"{score}", "inline": True})
-
-    # basis extras (only shown when provided)
-    if basis_pct is not None:
-        fields.append({"name": "Basis %", "value": f"{basis_pct:.4f}", "inline": True})
-    if basis_z is not None:
-        fields.append({"name": "Basis Z", "value": f"{basis_z:.3f}", "inline": True})
-
+    vwap: float,
+    rsi: float,
+    score: float,
+    triggers: list[str],
+    basis_pct: float | None = None,
+    basis_z: float | None = None,
+):
+    """Send live trade signal to #sniper-live"""
     embed = {
-        "title": title,
-        "description": description,
+        "title": f"📊 {exchange}:{symbol} {side}",
         "color": _side_color(side),
+        "fields": [
+            {"name": "Exchange", "value": exchange, "inline": True},
+            {"name": "Interval", "value": interval, "inline": True},
+            {"name": "Price", "value": f"{price:.4f}", "inline": True},
+            {"name": "VWAP", "value": f"{vwap:.4f}", "inline": True},
+            {"name": "RSI", "value": f"{rsi:.2f}", "inline": True},
+            {"name": "Score", "value": f"{score:.2f}", "inline": True},
+            {"name": "Triggers", "value": _fmt_triggers(triggers), "inline": False},
+        ],
         "timestamp": _now_iso(),
-        "fields": fields,
-        "footer": {"text": f"{exchange}:{symbol}:{interval}"},
     }
+    if basis_pct is not None:
+        embed["fields"].append({"name": "Basis %", "value": f"{basis_pct:.3f}", "inline": True})
+    if basis_z is not None:
+        embed["fields"].append({"name": "Basis Z", "value": f"{basis_z:.2f}", "inline": True})
 
-    await _post_json(WEBHOOK_LIVE, {"embeds": [embed]})
-
-
-async def post_backfill_summary(
-    venue: str,
-    symbol: str,
-    interval: str,
-    signals: int,
-    executions: int,
-    outcomes: int,
-) -> None:
-    content = (
-        f"✅ **Backfill** `{venue}:{symbol}:{interval}` → "
-        f"signals={signals} • executions={executions} • outcomes={outcomes}"
-    )
-    await _post_json(WEBHOOK_BACKFILL, {"content": content[:1990]})
+    await NOTIFY.post(WEBHOOK_LIVE, {"embeds": [embed]})
 
 
-async def post_performance_text(content: str) -> None:
-    """
-    Send a plain text/table performance block to #sniper-performance.
-    """
-    await _post_json(WEBHOOK_PERFORMANCE, {"content": content[:1990]})
+async def post_backfill_summary(venue: str, symbol: str, interval: str, signals: int, executions: int, outcomes: int):
+    msg = f"✅ **Backfill** `{venue}:{symbol}:{interval}` → signals={signals} • executions={executions} • outcomes={outcomes}"
+    await NOTIFY.post(WEBHOOK_BACKFILL, {"content": msg})
 
 
-async def post_error(msg: str) -> None:
-    await _post_json(WEBHOOK_ERRORS, {"content": f"⚠️ **Error:** {msg}"[:1990]})
+async def post_performance_text(content: str):
+    await NOTIFY.post(WEBHOOK_PERFORMANCE, {"content": f"📈 **Performance Report**\n```{content[:1900]}```"})
 
 
-# ---------------------------------------------------
-# High-level NOTIFY wrapper (new API + legacy aliases)
-# ---------------------------------------------------
-class _NotifierWrapper:
-    """
-    Facade used everywhere as NOTIFY.
-    Exposes:
-      - signal(), backfill(), perf(), error()   (new, concise API)
-      - post_signal_embed(), post_backfill_summary(), post_performance_text(), post_error() (legacy aliases)
-    """
-
-    # ---------- new / preferred ----------
-    async def signal(self, **kwargs) -> None:
-        # forwards all keyword args to post_signal_embed
-        await post_signal_embed(None, **kwargs)
-
-    async def backfill(self, *args, **kwargs) -> None:
-        await post_backfill_summary(*args, **kwargs)
-
-    async def perf(self, content: str) -> None:
-        await post_performance_text(content)
-
-    async def error(self, msg: str) -> None:
-        await post_error(msg)
-
-    # ---------- legacy aliases ----------
-    async def post_signal_embed(self, **kwargs) -> None:
-        await self.signal(**kwargs)
-
-    async def post_backfill_summary(self, *args, **kwargs) -> None:
-        await self.backfill(*args, **kwargs)
-
-    async def post_performance_text(self, content: str) -> None:
-        await self.perf(content)
-
-    async def post_error(self, msg: str) -> None:
-        await self.error(msg)
-
-
-# Export a singleton used throughout the app
-NOTIFY = _NotifierWrapper()
+async def post_error(msg: str):
+    await NOTIFY.post(WEBHOOK_ERRORS, {"content": f"⚠️ **Error:** {msg[:1900]}"})
