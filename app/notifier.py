@@ -1,143 +1,149 @@
 # app/notifier.py
 from __future__ import annotations
-
 import os
-from datetime import datetime, timezone
-from typing import Iterable, Optional, Dict, Any
-
 import aiohttp
+import asyncio
+from datetime import datetime, timezone
+from typing import Iterable, Optional, Dict, Any, List
 
-# ----------------- Webhook configuration -----------------
+from app.logger import get_logger
+
+log = get_logger("notifier")
+
+# ---- Channel webhooks (ENV first; fallback to provided defaults) ----
 WEBHOOK_LIVE        = os.getenv("DISCORD_WEBHOOK_LIVE",        "").strip()
 WEBHOOK_BACKFILL    = os.getenv("DISCORD_WEBHOOK_BACKFILL",    "").strip()
 WEBHOOK_ERRORS      = os.getenv("DISCORD_WEBHOOK_ERRORS",      "").strip()
 WEBHOOK_PERFORMANCE = os.getenv("DISCORD_WEBHOOK_PERFORMANCE", "").strip()
 
+# single shared session for this module
+_session: Optional[aiohttp.ClientSession] = None
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _fmt_triggers(trigs: Iterable[str] | None) -> str:
-    if not trigs:
-        return "—"
-    t = [str(x).strip() for x in trigs if str(x).strip()]
-    return " • ".join(t) if t else "—"
+async def _ensure_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession()
+    return _session
+
+async def _post_json(url: str, payload: Dict[str, Any]) -> None:
+    """Fire-and-forget safe post (logs clean errors, never dumps aiohttp objects)."""
+    if not url:
+        # allow running without Discord configured
+        return
+    try:
+        sess = await _ensure_session()
+        async with sess.post(url, json=payload, timeout=10) as resp:
+            if resp.status >= 300:
+                text = await resp.text()
+                log.error(f"[DISCORD] post failed {resp.status}: {text[:400]}")
+    except Exception as e:
+        log.exception(f"[DISCORD] post error: {e}")
+
+def _fmt_triggers(trigs: Iterable[str]) -> str:
+    t = [str(x).strip() for x in (trigs or []) if str(x).strip()]
+    return ", ".join(t) if t else "—"
 
 def _side_color(side: str) -> int:
-    s = (side or "").upper()
-    # green for LONG, red for SHORT, grey default
-    return 0x13A10E if s == "LONG" else (0xC50F1F if s == "SHORT" else 0x7A7A7A)
+    return 0x13A10E if (side or "").upper() == "LONG" else 0xC50F1F
 
-class DiscordNotifier:
+def _clip(s: Any, n: int) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return (s[: n - 1] + "…") if len(s) > n else s
+
+# ----------------- PUBLIC API -----------------
+
+async def post_signal_embed(
+    webhook: Optional[str],
+    *,
+    exchange: str,
+    symbol: str,
+    interval: str,
+    side: str,
+    price: float,
+    vwap: Optional[float] = None,
+    rsi: Optional[float] = None,
+    score: Optional[float] = None,
+    triggers: Optional[List[str]] = None,
+    basis_pct: Optional[float] = None,
+    basis_z: Optional[float] = None,
+) -> None:
     """
-    Single-session Discord notifier.
-    All calls are awaited and errors are surfaced via non-200 logs (no background tasks).
+    Send a trading signal embed to Discord.
+    Accepts optional basis fields for spot-perp signals.
+    If `webhook` is None, uses WEBHOOK_LIVE.
     """
-    def __init__(
-        self,
-        live: str = WEBHOOK_LIVE,
-        backfill: str = WEBHOOK_BACKFILL,
-        errors: str = WEBHOOK_ERRORS,
-        performance: str = WEBHOOK_PERFORMANCE,
-    ):
-        self.webhooks = {
-            "live": live,
-            "backfill": backfill,
-            "errors": errors,
-            "performance": performance,
-        }
-        self._session: Optional[aiohttp.ClientSession] = None
+    url = (webhook or WEBHOOK_LIVE or "").strip()
+    title = f"{symbol} • {side.upper()}"
+    desc_lines = [f"`{exchange}:{interval}`  •  {_fmt_triggers(triggers)}"]
+    if basis_pct is not None:
+        desc_lines.append(f"Basis: **{basis_pct:.4f}%**  Z: **{basis_z:.2f}**")
+    desc = "\n".join(desc_lines)
 
-    # ----------------- session lifecycle -----------------
-    async def _ensure(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-        return self._session
+    fields = [
+        {"name": "Price", "value": f"{price:.6g}", "inline": True},
+    ]
+    if vwap is not None:
+        fields.append({"name": "VWAP", "value": f"{vwap:.6g}", "inline": True})
+    if rsi is not None:
+        fields.append({"name": "RSI", "value": f"{float(rsi):.2f}", "inline": True})
+    if score is not None:
+        fields.append({"name": "Score", "value": f"{float(score):.3f}", "inline": True})
 
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+    embed = {
+        "title": _clip(title, 240),
+        "description": _clip(desc, 1000),
+        "color": _side_color(side),
+        "timestamp": _now_iso(),
+        "fields": fields[:25],  # Discord max fields
+        "footer": {"text": "QuickCap • Live Signal"},
+    }
 
-    # ----------------- low-level poster ------------------
-    async def _post_json(self, url: str, payload: Dict[str, Any]):
-        if not url:
-            return  # webhook not configured => silently skip
-        sess = await self._ensure()
-        try:
-            async with sess.post(url, json=payload) as resp:
-                if resp.status >= 300:
-                    txt = await resp.text()
-                    print(f"[DISCORD] POST failed {resp.status}: {txt}")
-        except Exception as e:
-            print(f"[DISCORD] POST error: {e}")
+    await _post_json(url, {"embeds": [embed]})
 
-    # ----------------- public helpers --------------------
-    async def post_error(self, msg: str):
-        """Plain text to #sniper-errors."""
-        content = f"⚠️ **Error** ({_now_iso()}):\n```{msg[:1900]}```"
-        await self._post_json(self.webhooks["errors"], {"content": content})
+async def post_backfill_summary(
+    venue: str,
+    symbol: str,
+    interval: str,
+    signals: int,
+    executions: int,
+    outcomes: int,
+) -> None:
+    """Text summary → #sniper-backfill."""
+    msg = (
+        f"✅ **Backfill** `{venue}:{symbol}:{interval}` → "
+        f"signals={signals} • executions={executions} • outcomes={outcomes}"
+    )
+    await _post_json(WEBHOOK_BACKFILL, {"content": _clip(msg, 1990)})
 
-    async def post_backfill_summary(self, venue: str, symbol: str, interval: str,
-                                    signals: int, executions: int, outcomes: int):
-        """Summary line to #sniper-backfill."""
-        content = (f"✅ **Backfill** `{venue}:{symbol}:{interval}` "
-                   f"→ signals={signals} • executions={executions} • outcomes={outcomes}")
-        await self._post_json(self.webhooks["backfill"], {"content": content[:1990]})
+async def post_performance_text(content: str) -> None:
+    """Tables/metrics → #sniper-performance (splits long text automatically)."""
+    if not WEBHOOK_PERFORMANCE:
+        return
+    # Discord message hard cap ~= 2000 chars
+    text = str(content or "")
+    chunks = []
+    while text:
+        chunk = text[:1900]
+        text = text[1900:]
+        chunks.append(chunk)
+    for i, ch in enumerate(chunks, 1):
+        suffix = f"\n`[{i}/{len(chunks)}]`" if len(chunks) > 1 else ""
+        await _post_json(WEBHOOK_PERFORMANCE, {"content": ch + suffix})
 
-    async def post_performance_text(self, text_block: str):
-        """Preformatted performance table(s) to #sniper-performance."""
-        content = f"**Sniper Performance**\n```{text_block[:1900]}```"
-        await self._post_json(self.webhooks["performance"], {"content": content})
+async def post_error(msg: str) -> None:
+    """Errors → #sniper-errors."""
+    await _post_json(WEBHOOK_ERRORS, {"content": _clip(f"⚠️ **Error:** {msg}", 1990)})
 
-    async def post_signal_embed(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        interval: str,
-        side: str,
-        price: float,
-        vwap: float,
-        rsi: float,
-        score: float,
-        triggers: Iterable[str] | None = None,
-        # optional spot-perp extras
-        basis_pct: Optional[float] = None,
-        basis_z: Optional[float] = None,
-        channel: str = "live",  # which webhook bucket to use
-    ):
-        """
-        Rich embed to #sniper-live (default) or any webhook key in self.webhooks.
-        """
-        fields = [
-            {"name": "Exchange", "value": f"{exchange}", "inline": True},
-            {"name": "Interval", "value": str(interval), "inline": True},
-            {"name": "Score", "value": f"{score:.3f}", "inline": True},
-
-            {"name": "Price", "value": f"{price:.6f}", "inline": True},
-            {"name": "VWAP",  "value": f"{vwap:.6f}",  "inline": True},
-            {"name": "RSI",   "value": f"{rsi:.2f}",   "inline": True},
-
-            {"name": "Triggers", "value": _fmt_triggers(triggers), "inline": False},
-        ]
-
-        # add basis fields if provided
-        if basis_pct is not None or basis_z is not None:
-            if basis_pct is not None:
-                fields.append({"name": "Basis %", "value": f"{basis_pct:.4f}", "inline": True})
-            if basis_z is not None:
-                fields.append({"name": "Basis Z", "value": f"{basis_z:.3f}", "inline": True})
-
-        embed = {
-            "title": f"{symbol} • {side.upper()}",
-            "description": f"**{exchange}** • `{interval}` • {_now_iso()}",
-            "color": _side_color(side),
-            "fields": fields,
-            "footer": {"text": "QuickCap • Live Signal"},
-        }
-
-        await self._post_json(self.webhooks.get(channel, WEBHOOK_LIVE), {"embeds": [embed]})
-
-# ----------------- simple module-level instance -----------------
-# If you prefer: from app.notifier import NOTIFY and call methods on it.
-NOTIFY = DiscordNotifier()
+# Optional: call at shutdown to close aiohttp cleanly
+async def close_notifier_session() -> None:
+    global _session
+    try:
+        if _session and not _session.closed:
+            await _session.close()
+    finally:
+        _session = None
