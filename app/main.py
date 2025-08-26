@@ -7,7 +7,7 @@ pd.set_option("future.no_silent_downcasting", True)
 
 import asyncio, time
 from datetime import datetime, timezone
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Any
 
 from app.config import load_settings
 from app.logger import get_logger
@@ -19,6 +19,7 @@ from app.executor import PaperExecutor
 from app.notifier import post_signal_embed
 from app.alpha.spot_perp_engine import compute_basis_signals
 from app.storage.supabase import Supa
+from app.policy import POLICY  # <<< NEW: central trade filter
 
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
@@ -74,6 +75,26 @@ async def _log_signal_and_exec_to_supa(
     except Exception as e:
         log.error(f"Supabase log error: {e}")
 
+def _build_ctx(strategy: str, venue: str, symbol: str, interval: str, side: str,
+               price: float, vwap: float, rsi: float, score: float,
+               triggers: List[str], extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    ctx = {
+        "strategy": strategy,          # "spot" | "basis"
+        "venue": venue,
+        "symbol": symbol,
+        "interval": interval,
+        "side": side,
+        "price": price,
+        "vwap": vwap,
+        "rsi": rsi,
+        "score": score,
+        "triggers": list(triggers or []),
+        "ts": _utc_now_iso(),
+    }
+    if extra:
+        ctx.update(extra)
+    return ctx
+
 async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str, executor: PaperExecutor):
     df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
     if len(df) < 50 or cfg.risk_off:
@@ -83,21 +104,35 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     last = sig.iloc[-1].copy()
     last["score"] = float(score_row(last))
 
-    triggers: list[str] = []
+    # trigger synthesis
+    triggers: List[str] = []
     if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
     if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
     if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
 
-    if not (triggers and last["score"] >= cfg.alert_min_score):
+    score = float(last["score"])
+    if not (triggers and score >= cfg.alert_min_score):
         return
 
+    # Cooldown per (venue, symbol)
     now = time.time(); key = (ex_name, symbol)
     if now - LAST_ALERT.get(key, 0) < cfg.alert_cooldown_sec:
         return
-    LAST_ALERT[key] = now
 
     side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
-    price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"]); score = float(last["score"])
+    price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"])
+
+    # ---------- POLICY GATE ----------
+    ctx = _build_ctx(
+        strategy="spot",
+        venue=ex_name, symbol=symbol, interval=str(cfg.interval), side=side,
+        price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers
+    )
+    if not POLICY.should_trade(ctx):
+        return  # filtered out (duplicate, flip, low score, wrong trigger, etc.)
+    # ---------------------------------
+
+    LAST_ALERT[key] = now  # only start cooldown once policy OK'd it
 
     # Build signal payload (UTC)
     signal_row = {
@@ -152,7 +187,22 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     side = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
     score = 2.0 + min(abs(sig["basis_z"]), 5.0)
 
-    # Build signal payload (note: we only write fields that exist in `signals`)
+    # ---------- POLICY GATE ----------
+    ctx = _build_ctx(
+        strategy="basis",
+        venue=venue, symbol=symbol, interval=str(cfg.interval), side=side,
+        price=float(sig["spot_close"]), vwap=float(sig["spot_vwap"]), rsi=float(sig["spot_rsi"]),
+        score=float(score), triggers=list(sig["triggers"]),
+        extra={
+            "basis_pct": float(sig["basis_pct"]),
+            "basis_z": float(sig["basis_z"]),
+        }
+    )
+    if not POLICY.should_trade(ctx):
+        return
+    # ---------------------------------
+
+    # Build signal payload
     signal_row = {
         "ts": _utc_now_iso(),
         "signal_type": "basis",
