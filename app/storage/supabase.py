@@ -1,70 +1,64 @@
 # app/storage/supabase.py
 from __future__ import annotations
-
-from typing import Iterable, Optional, Sequence, Dict, Any
-
-
-def _ensure_jsonable(v: Any) -> Any:
-    """
-    Supabase will happily take Python lists/dicts for JSON/JSONB columns and
-    Postgres arrays. Keep payloads simple (lists, numbers, strings, bools).
-    """
-    if v is None:
-        return None
-    if isinstance(v, (str, int, float, bool)):
-        return v
-    if isinstance(v, (list, tuple)):
-        return [_ensure_jsonable(x) for x in v]
-    if isinstance(v, dict):
-        return {str(k): _ensure_jsonable(v[k]) for k in v}
-    # Fallback to string representation for exotic types
-    return str(v)
-
+import json
+import requests
+from typing import Any, Dict, List
 
 class Supa:
-    """
-    Thin helper around the supabase-python client. All calls are synchronous
-    (client is sync), so it's safe to invoke from async code.
-    """
-    def __init__(self, url: str, key: str):
-        from supabase import create_client  # local import to avoid hard dep at import time
-        self._client = create_client(url, key)
+    def __init__(self, url: str, key: str, schema: str = "public"):
+        if not url or not key:
+            raise ValueError("Supabase URL and Key are required")
+        self.url = url.rstrip("/")
+        self.key = key
+        self.schema = schema
+        self.headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates"
+        }
 
-    # --------------- single row writers ---------------
+    # ---- low-level helper ----
+    def _post(self, table: str, rows: List[Dict[str, Any]]):
+        resp = requests.post(
+            f"{self.url}/rest/v1/{table}",
+            headers=self.headers,
+            data=json.dumps(rows),
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Supabase insert failed [{resp.status_code}]: {resp.text}")
+        return resp.json() if resp.text else {}
 
-    def log_signal(self, **row) -> None:
+    # ---- signal logging ----
+    def log_signal(self, **kwargs):
         """
-        Expected columns in `signals`:
-          ts (timestamptz), signal_type, venue, symbol, interval, side,
-          price, vwap, rsi, score, triggers (json/array), signal_key (text, unique)
+        Insert a trading signal. Must include `signal_key`.
         """
-        payload = dict(row)
-        if "triggers" in payload:
-            payload["triggers"] = _ensure_jsonable(payload["triggers"])
-        # Upsert on signal_key so backfills & repeats don't duplicate
-        self._client.table("signals").upsert(payload, on_conflict="signal_key").execute()
+        if "signal_key" not in kwargs:
+            kwargs["signal_key"] = f"{kwargs.get('venue')}:{kwargs.get('symbol')}:{kwargs.get('ts')}"
+        return self._post("signals", [kwargs])
 
-    def log_execution(self, **row) -> None:
+    def log_execution(self, **kwargs):
         """
-        Insert into executions. Typical columns:
-          ts, venue, symbol, side, price, score, reason, is_paper
+        Insert execution (paper/live). No FK required.
         """
-        payload = dict(row)
-        self._client.table("executions").insert(payload).execute()
+        return self._post("executions", [kwargs])
 
-    # --------------- bulk writer ---------------
-
-    def bulk_insert(self, table: str, rows: Sequence[Dict[str, Any]], on_conflict: Optional[str] = None) -> None:
+    def bulk_insert(self, table: str, rows: List[Dict[str, Any]], on_conflict: str | None = None):
         """
-        Bulk insert/upsert. For outcomes we usually pass on_conflict="signal_key,horizon_m".
+        Insert/upsert multiple rows with conflict resolution.
+        Example: bulk_insert("signal_outcomes", rows, on_conflict="signal_key,horizon_m")
         """
         if not rows:
-            return
-        clean = []
-        for r in rows:
-            rr = {k: _ensure_jsonable(v) for k, v in r.items()}
-            clean.append(rr)
+            return {}
+
+        url = f"{self.url}/rest/v1/{table}"
+        headers = self.headers.copy()
         if on_conflict:
-            self._client.table(table).upsert(clean, on_conflict=on_conflict).execute()
-        else:
-            self._client.table(table).insert(clean).execute()
+            headers["Prefer"] = f"resolution=merge-duplicates,return=minimal"
+            url += f"?on_conflict={on_conflict}"
+
+        resp = requests.post(url, headers=headers, data=json.dumps(rows))
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Supabase bulk_insert failed [{resp.status_code}]: {resp.text}")
+        return resp.json() if resp.text else {}
