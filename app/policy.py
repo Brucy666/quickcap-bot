@@ -1,95 +1,84 @@
 # app/policy.py
 from __future__ import annotations
-import os, time
+
+import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
-# ---- Buckets by reason text ----
+# Bucketing helpers
 EVENT_GOOD = ("Perp Discount Capitulation", "Perp Premium Blowoff")
-RSI_FAMILY  = ("RSI Reversal", "RSI Reversal Risk", "Discount + RSI", "Premium + RSI")
-MOMENTUM    = ("Momentum Pop",)
+RSI_FAMILY = ("RSI Reversal", "RSI Reversal Risk", "Premium", "Discount")
+MOMENTUM   = ("Momentum Pop",)
 
-# ---------- cooldown / anti flip-flop ----------
-class _CooldownCache:
+@dataclass
+class _Last:
+    ts: float
+    side: str
+    score: float
+
+class _Cooldowns:
+    """
+    Tracks last trade per (bucket,symbol) with anti-flip and min spacing.
+    """
     def __init__(self):
-        # key -> (last_ts, last_side, last_score)
-        self.last: Dict[str, Tuple[float, str, float]] = {}
+        self._mem: Dict[str, _Last] = {}
 
-    def ok(self, key: str, min_gap_s: int, new_side: str, new_score: float, flip_bonus: float) -> bool:
+    def ok(self, key: str, *, min_gap_s: int, new_side: str, new_score: float, flip_bonus: float) -> bool:
         now = time.time()
-        prev = self.last.get(key)
-        if prev is None:
-            self.last[key] = (now, new_side, new_score)
+        last = self._mem.get(key)
+        if last is None:
+            self._mem[key] = _Last(now, new_side, new_score)
             return True
-        ts, prev_side, prev_score = prev
 
-        # 1) basic cooldown
-        if now - ts < min_gap_s:
+        # 1) spacing
+        if (now - last.ts) < min_gap_s:
             return False
 
-        # 2) anti flip-flop: if we are changing side, require strictly better score
-        if prev_side != new_side and (new_score < prev_score + flip_bonus):
+        # 2) anti flip-flop: if changing side, require >= previous score + flip_bonus
+        if last.side != new_side and (new_score < last.score + flip_bonus):
             return False
 
-        self.last[key] = (now, new_side, new_score)
+        self._mem[key] = _Last(now, new_side, new_score)
         return True
 
-COOLDOWNS = _CooldownCache()
 
-# -------------- helpers --------------
-def _f(env: str, default: float) -> float:
-    try: return float(os.getenv(env, default))
-    except Exception: return default
-
-def _b(env: str, default: bool) -> bool:
-    v = os.getenv(env)
-    return default if v is None else v.strip() in ("1", "true", "True", "yes", "YES")
-
-def _reason_bucket(reason: str) -> str:
-    r = reason or ""
-    if any(t in r for t in EVENT_GOOD): return "event"
-    if any(t in r for t in MOMENTUM):   return "momo"
-    if "Premium" in r or "Discount" in r or any(t in r for t in RSI_FAMILY):
-        return "rsi"
-    return "other"
-
-def _has(trigs: Optional[Iterable[str]], needle: str) -> bool:
-    if not trigs: return False
-    n = needle.lower()
-    return any(n in str(x).lower() for x in trigs)
-
-# -------------- decision type --------------
-@dataclass
-class Decision:
-    take: bool
-    why: str
-    cooldown_s: int = 0
-
-# -------------- main policy --------------
-@dataclass
 class TradingPolicy:
-    # thresholds (env overrideable)
-    min_score_event: float = _f("POLICY_MIN_SCORE_EVENT", 5.5)
-    min_score_rsi:   float = _f("POLICY_MIN_SCORE_RSI",   6.0)
-    min_score_momo:  float = _f("POLICY_MIN_SCORE_MOMO",  4.2)
+    """
+    Central trade filter. Keep it conservative; the scoring function handles ‘alpha’,
+    this policy handles *when to act*.
+    """
 
-    # cool-downs (seconds)
-    cd_event_s: int = int(_f("POLICY_CD_EVENT_S", 180))   # 3 min
-    cd_rsi_s:   int = int(_f("POLICY_CD_RSI_S",   600))   # 10 min
-    cd_momo_s:  int = int(_f("POLICY_CD_MOMO_S",  900))   # 15 min
+    # score gates (tune here)
+    MIN_EVENT = 5.5      # Perp capitulation/blowoff style
+    MIN_RSI   = 6.0      # mean-reversion / premium/discount + RSI combos
+    MIN_MOMO  = 4.2      # momentum pops (executor can size smaller)
 
-    # anti flip-flop bonus: new score must exceed previous by this much when changing side
-    flip_bonus: float = _f("POLICY_FLIP_BONUS", 0.75)
+    # cooldowns (seconds)
+    CD_EVENT = 180       # symbol-level spacing for event plays
+    CD_RSI   = 600       # RSI/premium/discount style
+    CD_MOMO  = 900       # momentum pops (avoid spam)
 
-    # quality rails
-    rsi_long_max: float = _f("POLICY_RSI_LONG_MAX", 72.0)
-    rsi_short_min: float = _f("POLICY_RSI_SHORT_MIN", 28.0)
-    max_vwap_dist_pct: float = _f("POLICY_MAX_VWAP_DIST_PCT", 0.35)
+    # flipping protection
+    FLIP_BONUS = 0.75    # if flipping side, require new_score >= old_score + FLIP_BONUS
 
-    # toggles
-    allow_momentum: bool = _b("POLICY_ALLOW_MOMENTUM", False)
+    def __init__(self):
+        self._cool = _Cooldowns()
 
-    # ---- Public API (the one live worker uses) ----
+    @staticmethod
+    def _bucket(reason: Optional[str], triggers: Optional[Iterable[str]]) -> str:
+        r = (reason or "").strip()
+        t = " ".join(list(triggers or []))
+
+        blob = f"{r} {t}"
+
+        if any(s in blob for s in EVENT_GOOD):
+            return "event"
+        if any(s in blob for s in MOMENTUM):
+            return "momo"
+        if any(s in blob for s in RSI_FAMILY):
+            return "rsi"
+        return "other"
+
     def should_trade(
         self,
         *,
@@ -102,88 +91,45 @@ class TradingPolicy:
         triggers: Optional[Iterable[str]],
         symbol: Optional[str] = None,
         reason: Optional[str] = None,
+        venue: Optional[str] = None,            # accepted (unused now; useful later)
+        **_ignore,                               # swallow any future keywords safely
     ) -> bool:
         """
-        Central gate for live trades. Returns True to allow the trade.
-        Also enforces per-bucket cooldown + anti-flip logic using symbol.
+        Return True if we should place a trade for this signal.
         """
         sym   = (symbol or "").upper()
-        sd    = (side or "").upper()
-        sc    = float(score or 0.0)
-        rs    = None if rsi is None else float(rsi)
-        vw    = None if vwap is None else float(vwap)
-        cl    = None if close is None else float(close)
+        side  = (side or "").upper()
+        score = float(score or 0.0)
 
-        # Build a reason string if not provided (used for bucketing)
-        if not reason:
-            reason = ", ".join(triggers or []) if triggers else ""
+        bucket = self._bucket(reason, triggers)
 
-        # Momentum optionally disabled
-        if _has(triggers, "Momentum Pop") and not self.allow_momentum:
-            return False
-
-        # Quality rails (spot & basis): near VWAP and sane RSI
-        if vw and cl:
-            dist = abs(cl - vw) / vw * 100.0
-            if dist > self.max_vwap_dist_pct:
-                return False
-        if signal_type != "basis" and rs is not None:  # RSI rails only for spot
-            if sd == "LONG"  and rs > self.rsi_long_max:  return False
-            if sd == "SHORT" and rs < self.rsi_short_min: return False
-
-        # Bucket & thresholds
-        bucket = _reason_bucket(reason)
+        # Event plays
         if bucket == "event":
-            if sc < self.min_score_event: return False
+            if score < self.MIN_EVENT:
+                return False
             key = f"event::{sym}"
-            return COOLDOWNS.ok(key, self.cd_event_s, sd, sc, self.flip_bonus)
+            return self._cool.ok(key, min_gap_s=self.CD_EVENT, new_side=side,
+                                 new_score=score, flip_bonus=self.FLIP_BONUS)
 
+        # RSI / premium/discount mean-reversion style
         if bucket == "rsi":
-            if sc < self.min_score_rsi: return False
+            if score < self.MIN_RSI:
+                return False
             key = f"rsi::{sym}"
-            return COOLDOWNS.ok(key, self.cd_rsi_s, sd, sc, self.flip_bonus)
+            return self._cool.ok(key, min_gap_s=self.CD_RSI, new_side=side,
+                                 new_score=score, flip_bonus=self.FLIP_BONUS)
 
+        # Momentum pops
         if bucket == "momo":
-            if sc < self.min_score_momo: return False
+            if score < self.MIN_MOMO:
+                return False
             key = f"momo::{sym}"
-            return COOLDOWNS.ok(key, self.cd_momo_s, sd, sc, self.flip_bonus)
+            return self._cool.ok(key, min_gap_s=self.CD_MOMO, new_side=side,
+                                 new_score=score, flip_bonus=self.FLIP_BONUS)
 
-        # Ignore anything we can't classify
+        # everything else: skip
         return False
 
-    # ---- Backwards-compat: old dict style ----
-    def should_trade_dict(self, sig: Dict) -> Decision:
-        """
-        Legacy entrypoint used by backfill/tests.
-        Expects keys: symbol, side, score, reason (or triggers), ts...
-        """
-        symbol = (sig.get("symbol") or "").upper()
-        side   = (sig.get("side") or "").upper()
-        score  = float(sig.get("score") or 0.0)
-        reason = str(sig.get("reason") or " ".join(sig.get("triggers", []) or []))
 
-        # quick bucket
-        bucket = _reason_bucket(reason)
-        if bucket == "event":
-            if score < self.min_score_event:
-                return Decision(False, f"score<{self.min_score_event} for EVENT")
-            ok = COOLDOWNS.ok(f"event::{symbol}", self.cd_event_s, side, score, self.flip_bonus)
-            return Decision(ok, "EVENT ok" if ok else "event cooldown/flip", self.cd_event_s)
-
-        if bucket == "rsi":
-            if score < self.min_score_rsi:
-                return Decision(False, f"score<{self.min_score_rsi} for RSI")
-            ok = COOLDOWNS.ok(f"rsi::{symbol}", self.cd_rsi_s, side, score, self.flip_bonus)
-            return Decision(ok, "RSI ok" if ok else "rsi cooldown/flip", self.cd_rsi_s)
-
-        if bucket == "momo":
-            if score < self.min_score_momo:
-                return Decision(False, f"score<{self.min_score_momo} for MOMO")
-            ok = COOLDOWNS.ok(f"momo::{symbol}", self.cd_momo_s, side, score, self.flip_bonus)
-            return Decision(ok, "MOMO ok" if ok else "momo cooldown/flip", self.cd_momo_s)
-
-        return Decision(False, "unknown bucket", 0)
-
-
-# Exported singleton used by app.main
+# Singleton instance imported by main
 POLICY = TradingPolicy()
