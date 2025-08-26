@@ -1,110 +1,69 @@
 # app/storage/supabase.py
 from __future__ import annotations
+import os, aiohttp, asyncio
+from typing import Any, Dict
+from app.logger import get_logger
 
-import json
-from typing import Any, Dict, List, Optional
-
-import aiohttp
-
+log = get_logger("supabase")
 
 class Supa:
-    """
-    Minimal async Supabase REST client that uses aiohttp (already in your stack).
-    - Ensures every signal has a stable `signal_key`
-    - Upserts with on_conflict when asked
-    - No extra dependencies
-    """
-
-    def __init__(
-        self,
-        url: str,
-        key: str,
-        *,
-        schema: str = "public",
-        supports_outcomes: bool = False,
-        session: Optional[aiohttp.ClientSession] = None,
-    ):
-        if not url or not key:
-            raise ValueError("Supabase URL and Key are required")
+    def __init__(self, url: str, key: str):
         self.url = url.rstrip("/")
         self.key = key
-        self.schema = schema
-        self._session = session
-        self.supports_outcomes = supports_outcomes  # set True only if your DB uses signal_key FKs
-
-        self._base_headers = {
+        self._headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            # Allow upserts to merge duplicates
-            "Prefer": "resolution=merge-duplicates",
         }
 
-    # ---------------- internal helpers ----------------
-
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-
-    async def _post(
-        self,
-        table: str,
-        rows: List[Dict[str, Any]],
-        *,
-        on_conflict: Optional[str] = None,
-        prefer_return: str = "minimal",
-    ) -> Dict[str, Any]:
-        if not rows:
-            return {}
-        sess = await self._ensure_session()
-        headers = dict(self._base_headers)
-        # Return policy: minimal avoids large payloads
-        headers["Prefer"] = f"{headers['Prefer']},return={prefer_return}"
-
+    async def _post(self, table: str, row: Dict[str, Any]):
+        """Insert a single row into Supabase, filtering unknown keys."""
+        clean_row = {k: v for k, v in row.items() if v is not None}  # drop nulls
         url = f"{self.url}/rest/v1/{table}"
+        async with aiohttp.ClientSession() as s:
+            try:
+                async with s.post(
+                    url, headers=self._headers, json=clean_row, params={"return": "minimal"}
+                ) as r:
+                    if r.status >= 300:
+                        txt = await r.text()
+                        log.error(f"Supabase POST {table} failed {r.status}: {txt}")
+            except Exception as e:
+                log.error(f"Supabase error posting to {table}: {e}")
+
+    async def log_signal(self, **row):
+        # Only keep safe columns for signals table
+        allowed = {
+            "ts", "signal_type", "venue", "symbol", "interval",
+            "side", "price", "vwap", "rsi", "score", "triggers"
+        }
+        clean = {k: row[k] for k in row if k in allowed}
+        await self._post("signals", clean)
+
+    async def log_execution(self, **row):
+        # Only keep safe columns for executions table
+        allowed = {
+            "ts", "venue", "symbol", "side",
+            "price", "score", "reason", "is_paper"
+        }
+        clean = {k: row[k] for k in row if k in allowed}
+        await self._post("executions", clean)
+
+    async def bulk_insert(self, table: str, rows: list[Dict[str, Any]], on_conflict: str | None = None):
+        if not rows:
+            return
+        clean_rows = []
+        for r in rows:
+            clean_rows.append({k: v for k, v in r.items() if v is not None})
+        url = f"{self.url}/rest/v1/{table}"
+        params = {"return": "minimal"}
         if on_conflict:
-            url += f"?on_conflict={on_conflict}"
-
-        async with sess.post(url, headers=headers, data=json.dumps(rows)) as resp:
-            txt = await resp.text()
-            if resp.status >= 300:
-                raise RuntimeError(f"Supabase POST {table} failed [{resp.status}]: {txt}")
-            return json.loads(txt) if txt else {}
-
-    # ---------------- public API ----------------
-
-    async def log_signal(self, **kwargs) -> Dict[str, Any]:
-        """
-        Insert a signal row into 'signals'.
-        Ensures a stable signal_key if caller didn't provide one.
-        """
-        if "signal_key" not in kwargs or not kwargs["signal_key"]:
-            # venue:symbol:ts is stable for backfills & live
-            kwargs["signal_key"] = f"{kwargs.get('venue')}:{kwargs.get('symbol')}:{kwargs.get('ts')}"
-        return await self._post("signals", [kwargs], prefer_return="minimal")
-
-    async def log_execution(self, **kwargs) -> Dict[str, Any]:
-        """
-        Insert an execution row into 'executions'.
-        """
-        return await self._post("executions", [kwargs], prefer_return="minimal")
-
-    async def bulk_insert(
-        self,
-        table: str,
-        rows: List[Dict[str, Any]],
-        *,
-        on_conflict: Optional[str] = None,
-        prefer_return: str = "minimal",
-    ) -> Dict[str, Any]:
-        """
-        Bulk insert/upsert rows into a table.
-        Example for outcomes (only if your schema supports signal_key FKs):
-          await supa.bulk_insert("signal_outcomes", rows, on_conflict="signal_key,horizon_m")
-        """
-        return await self._post(table, rows, on_conflict=on_conflict, prefer_return=prefer_return)
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+            params["on_conflict"] = on_conflict
+        async with aiohttp.ClientSession() as s:
+            try:
+                async with s.post(url, headers=self._headers, json=clean_rows, params=params) as r:
+                    if r.status >= 300:
+                        txt = await r.text()
+                        log.error(f"Supabase bulk insert {table} failed {r.status}: {txt}")
+            except Exception as e:
+                log.error(f"Supabase bulk insert error {table}: {e}")
