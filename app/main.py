@@ -1,15 +1,19 @@
 # app/main.py
 from __future__ import annotations
+
+# ---- housekeeping / pandas warnings -----------------------------------------
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import pandas as pd
 pd.set_option("future.no_silent_downcasting", True)
 
+# ---- stdlib ------------------------------------------------------------------
 import asyncio, time
 from datetime import datetime, timezone
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
+# ---- project imports ---------------------------------------------------------
 from app.config import load_settings
 from app.logger import get_logger
 from app.utils import to_dataframe
@@ -20,7 +24,7 @@ from app.executor import PaperExecutor
 from app.notifier import post_signal_embed
 from app.alpha.spot_perp_engine import compute_basis_signals
 from app.storage.supabase import Supa
-from app.policy import POLICY  # <- central trade filter
+from app.policy import POLICY  # TradingPolicy singleton
 
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
@@ -29,8 +33,10 @@ from app.exchanges import (
 )
 
 log = get_logger("main")
-LAST_ALERT: Dict[Tuple[str, str], float] = {}
 
+# ------------------------------------------------------------------------------
+# EXCHANGE REGISTRY
+# ------------------------------------------------------------------------------
 SPOT_ADAPTERS = {
     "kucoin": KuCoinPublic,
     "mexc": MEXCPublic,
@@ -44,124 +50,142 @@ PERP_VENUES = {
     "bybit": (BybitSpotPublic, BybitPerpPublic),
 }
 
-
-# ---------- small utils ----------
+LAST_ALERT: Dict[Tuple[str, str], float] = {}  # (venue,symbol) -> last ts
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _build_spot_exchanges(enabled: List[str]):
-    return [(name, SPOT_ADAPTERS[name]()) for name in SPOT_ADAPTERS if name in enabled]
+# ------------------------------------------------------------------------------
+# SINGLETON SUPABASE CLIENT
+# ------------------------------------------------------------------------------
+_SUPA_SINGLETON: Optional[Supa] = None
 
-def _supa(cfg):
-    if getattr(cfg, "supabase_enabled", False) and cfg.supabase_url and cfg.supabase_key:
-        try:
-            return Supa(cfg.supabase_url, cfg.supabase_key)
-        except Exception as e:
-            log.warning(f"Supabase init failed: {e}")
-    return None
+def get_supa(cfg) -> Optional[Supa]:
+    """Create once and reuse the same Supabase client."""
+    global _SUPA_SINGLETON
+    if not getattr(cfg, "supabase_enabled", False):
+        return None
+    if _SUPA_SINGLETON is None:
+        _SUPA_SINGLETON = Supa(cfg.supabase_url, cfg.supabase_key)
+    return _SUPA_SINGLETON
 
-async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
+# ------------------------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------------------------
+async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int) -> pd.DataFrame:
     try:
         kl = await ex.fetch_klines(symbol, interval, lookback)
-        return to_dataframe(kl)
-    except Exception:
-        return to_dataframe([])
+    except Exception as e:
+        log.warning(f"fetch_klines failed {getattr(ex,'__class__',type(ex)).__name__} {symbol}: {e}")
+        kl = []
+    df = to_dataframe(kl)
+    if "close" in df:
+        df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
+    return df.reset_index(drop=True)
 
-async def _log_signal_and_exec_to_supa(
-    supa: Supa | None,
-    signal_payload: dict,
-    exec_payload: dict | None = None,
-) -> None:
+async def _log_to_supa(
+    supa: Optional[Supa],
+    signal_row: Optional[dict] = None,
+    exec_row: Optional[dict] = None,
+):
     if not supa:
         return
     try:
-        # fire-and-forget
-        asyncio.create_task(supa.log_signal(**signal_payload))
-        if exec_payload:
-            asyncio.create_task(supa.log_execution(**exec_payload))
+        if signal_row:
+            asyncio.create_task(supa.log_signal(**signal_row))
+        if exec_row:
+            asyncio.create_task(supa.log_execution(**exec_row))
     except Exception as e:
         log.error(f"Supabase log error: {e}")
 
-
-# ---------- core: spot flow ----------
-
-async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str, executor: PaperExecutor):
+# ------------------------------------------------------------------------------
+# SPOT SIGNALS
+# ------------------------------------------------------------------------------
+async def _process_symbol(cfg, supa: Optional[Supa], venue: str, ex, symbol: str, executor: PaperExecutor):
     df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
     if len(df) < 50 or cfg.risk_off:
         return
 
     sig = compute_signals(df)
-    last = sig.iloc[-1].copy()
+    row = sig.iloc[-1].copy()
+    row["score"] = float(score_row(row))
 
-    price = float(last.get("close", df["close"].iloc[-1]))
-    vwap  = float(last.get("vwap",  df["vwap"].iloc[-1] if "vwap" in df else price))
-    rsi   = float(last.get("rsi",   0.0))
-    last_score = float(score_row(last))
-
-    # triggers text (for Discord & reason)
-    triggers: list[str] = []
-    if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
-    if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
-    if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
-    reason = ", ".join(triggers)
-
-    # side heuristic
-    side = "LONG"
-    if last.get("sweep_short") or last.get("bear_div"):
-        side = "SHORT"
-    if last.get("sweep_long") or last.get("bull_div"):
-        side = "LONG"
-
-    # cooldown
-    now = time.time()
-    key = (ex_name, symbol)
-    if now - LAST_ALERT.get(key, 0) < cfg.alert_cooldown_sec:
+    # triggers for embed / reason text
+    triggers: List[str] = []
+    if row.get("sweep_long") and row.get("bull_div"):  triggers.append("VWAP sweep + Bull Div")
+    if row.get("sweep_short") and row.get("bear_div"): triggers.append("VWAP sweep + Bear Div")
+    if bool(row.get("mom_pop")):                        triggers.append("Momentum Pop")
+    if not triggers:
         return
 
-    # --- POLICY gate (complete context, no 'close' key included)
-    dec = POLICY.should_trade(
+    side = "LONG" if (row.get("sweep_long") or row.get("bull_div")) else "SHORT"
+    price = float(row.get("close"))
+    vwap  = float(row.get("vwap"))
+    rsi   = float(row.get("rsi"))
+    score = float(row.get("score"))
+
+    # policy context
+    reason = " | ".join(triggers)
+    ctx = dict(
         symbol=symbol,
-        side=side,
-        score=last_score,
-        reason=reason,
+        venue=venue,
         signal_type="spot",
-        rsi=rsi,
-        vwap=vwap,
-        triggers=triggers,
-        venue=ex_name,
         interval=cfg.interval,
-        price=price,
+        side=side,
+        score=score,
+        reason=reason,
+        triggers=list(triggers),
+        close=price,
+        vwap=vwap,
+        rsi=rsi,
+        ts=_utc_now_iso(),
     )
+
+    dec = POLICY.should_trade(**ctx)
     if not dec.take:
+        return
+
+    # global cooldown on venue+symbol (coexists with policy’s buckets)
+    now = time.time()
+    key = (venue, symbol)
+    if now - LAST_ALERT.get(key, 0.0) < max(5, int(cfg.alert_cooldown_sec)):
         return
     LAST_ALERT[key] = now
 
-    # Supabase row (match schema: no 'close')
+    # build DB row (columns must match your 'signals' table)
     signal_row = {
-        "ts": _utc_now_iso(),
+        "ts": ctx["ts"],
         "signal_type": "spot",
-        "venue": ex_name,
+        "venue": venue,
         "symbol": symbol,
         "interval": cfg.interval,
         "side": side,
         "price": price,
         "vwap": vwap,
         "rsi": rsi,
-        "score": float(last_score),
-        "triggers": list(triggers),
-        "reason": reason,
+        "score": score,
+        "triggers": triggers,
     }
 
-    # Discord alert
-    await post_signal_embed(
-        cfg.discord_webhook,
-        exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
-        price=price, vwap=vwap, rsi=rsi, score=float(last_score), triggers=list(triggers),
-    )
+    # Discord (best effort)
+    try:
+        await post_signal_embed(
+            cfg.discord_webhook,
+            exchange=venue,
+            symbol=symbol,
+            interval=cfg.interval,
+            side=side,
+            price=price,
+            vwap=vwap,
+            rsi=rsi,
+            score=score,
+            triggers=triggers,
+        )
+    except Exception as e:
+        log.warning(f"discord post failed: {e}")
 
-    # Paper execution
-    exec_rec = await executor.submit(symbol, side, price, float(last_score), reason or "signal")
+    # Paper trade + execution row
+    exec_rec = await executor.submit(symbol, side, price, score, reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
         "venue": exec_rec["venue"],
@@ -173,17 +197,19 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         "is_paper": exec_rec["is_paper"],
     }
 
-    await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
+    await _log_to_supa(supa, signal_row, exec_row)
 
-
-# ---------- core: spot–perp basis flow ----------
-
-async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str, executor: PaperExecutor):
+# ------------------------------------------------------------------------------
+# BASIS (SPOT-PERP) SIGNALS
+# ------------------------------------------------------------------------------
+async def _spot_perp_for_symbol(cfg, supa: Optional[Supa], venue: str, symbol: str, executor: PaperExecutor):
     pair = PERP_VENUES.get(venue)
     if not pair:
         return
+
     spot_cls, perp_cls = pair
-    spot = spot_cls(); perp = perp_cls()
+    spot, perp = spot_cls(), perp_cls()
+
     s_df = await _fetch_symbol(spot, symbol, cfg.interval, cfg.lookback)
     p_df = await _fetch_symbol(perp, symbol, cfg.interval, cfg.lookback)
     if len(s_df) < 50 or len(p_df) < 50:
@@ -193,45 +219,44 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     if not sig.get("ok") or not sig["triggers"]:
         return
 
-    # basis meta
-    basis_pct = float(sig["basis_pct"])
-    basis_z   = float(sig["basis_z"])
-    side      = sig["side"] or ("SHORT" if basis_pct > 0 else "LONG")
-    price     = float(sig["spot_close"])
-    vwap      = float(sig["spot_vwap"])
-    rsi       = float(sig["spot_rsi"])
-    score     = 2.0 + min(abs(basis_z), 5.0)
-    triggers  = list(sig["triggers"])
-    reason    = "Basis:" + ", ".join(triggers)
+    # Compute a score from basis Z but DO NOT post unknown columns to Supabase
+    side  = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
+    score = 2.0 + min(abs(float(sig["basis_z"])), 5.0)
 
-    # POLICY gate
-    dec = POLICY.should_trade(
+    price = float(sig["spot_close"])
+    vwap  = float(sig["spot_vwap"])
+    rsi   = float(sig["spot_rsi"])
+    triggers = list(sig["triggers"])
+    reason = "Basis:" + ", ".join(triggers)
+
+    ctx = dict(
         symbol=symbol,
-        side=side,
-        score=float(score),
-        reason=reason,
-        signal_type="basis",
-        rsi=rsi,
-        vwap=vwap,
-        triggers=triggers,
         venue=venue,
+        signal_type="basis",
         interval=cfg.interval,
-        price=price,
+        side=side,
+        score=score,
+        reason=reason,
+        triggers=triggers,
+        close=price,
+        vwap=vwap,
+        rsi=rsi,
+        ts=_utc_now_iso(),
     )
+    dec = POLICY.should_trade(**ctx)
     if not dec.take:
         return
 
-    # Discord
-    await post_signal_embed(
-        cfg.discord_webhook,
-        exchange=f"{venue}:BASIS", symbol=symbol, interval=cfg.interval, side=side,
-        price=price, vwap=vwap, rsi=rsi, score=float(score), triggers=triggers,
-        basis_pct=basis_pct, basis_z=basis_z,
-    )
+    # simple venue+symbol guard
+    now = time.time()
+    key = (venue, symbol)
+    if now - LAST_ALERT.get(key, 0.0) < max(5, int(cfg.alert_cooldown_sec)):
+        return
+    LAST_ALERT[key] = now
 
-    # Supabase signal (NO 'close' field)
+    # signals table row (keep only columns that exist!)
     signal_row = {
-        "ts": _utc_now_iso(),
+        "ts": ctx["ts"],
         "signal_type": "basis",
         "venue": venue,
         "symbol": symbol,
@@ -242,14 +267,27 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         "rsi": rsi,
         "score": float(score),
         "triggers": triggers,
-        "reason": reason,
-        # basis extras are supported by supabase.Supa.log_signal via extra kwargs;
-        # if your DB doesn't have these cols, Supa will filter them out.
-        "basis_pct": basis_pct,
-        "basis_z": basis_z,
     }
 
-    # paper exec
+    # Discord (show basis info only in the embed fields; not sent to DB)
+    try:
+        await post_signal_embed(
+            cfg.discord_webhook,
+            exchange=f"{venue}:BASIS",
+            symbol=symbol,
+            interval=cfg.interval,
+            side=side,
+            price=price,
+            vwap=vwap,
+            rsi=rsi,
+            score=score,
+            triggers=triggers,
+            basis_pct=float(sig["basis_pct"]),
+            basis_z=float(sig["basis_z"]),
+        )
+    except Exception as e:
+        log.warning(f"discord post (basis) failed: {e}")
+
     exec_rec = await executor.submit(symbol, side, price, float(score), reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
@@ -262,16 +300,17 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         "is_paper": exec_rec["is_paper"],
     }
 
-    await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
+    await _log_to_supa(supa, signal_row, exec_row)
 
-
-# ---------- orchestrators ----------
-
+# ------------------------------------------------------------------------------
+# SCANNERS
+# ------------------------------------------------------------------------------
 async def scan_once():
     cfg = load_settings()
-    supa = _supa(cfg)
+    supa = get_supa(cfg)  # reuse singleton
     executor = PaperExecutor(cfg.max_pos_usdt)
 
+    # Build per-venue hotlist (or just use configured symbols)
     if cfg.hotlist_enabled:
         hotmap = await build_hotmap(
             cfg.exchanges,
@@ -284,29 +323,40 @@ async def scan_once():
     else:
         hotmap = {ex: list(cfg.symbols) for ex in cfg.exchanges}
 
-    # spot scan
-    for ex_name, ex in _build_spot_exchanges(cfg.exchanges):
-        for sym in (hotmap.get(ex_name, []) or list(cfg.symbols)):
-            await _process_symbol(cfg, supa, ex_name, ex, sym, executor)
+    # Spot scanner
+    for venue, ex_cls in SPOT_ADAPTERS.items():
+        if venue not in cfg.exchanges:
+            continue
+        ex = ex_cls()
+        for sym in (hotmap.get(venue, []) or list(cfg.symbols)):
+            await _process_symbol(cfg, supa, venue, ex, sym, executor)
 
-    # basis scan
+    # Basis scanner
     if cfg.spot_perp_enabled:
         for venue in cfg.spot_perp_exchanges:
             for sym in (hotmap.get(venue, []) or list(cfg.symbols)):
                 await _spot_perp_for_symbol(cfg, supa, venue, sym, executor)
 
+# ------------------------------------------------------------------------------
+# MAIN LOOP
+# ------------------------------------------------------------------------------
 async def main_loop():
     cfg = load_settings()
     period = max(10, int(cfg.scan_period_sec))
+    supa = get_supa(cfg)  # ensure created before loop (and closed after)
     log.info(f"Starting scan loop | exchanges={cfg.exchanges} interval={cfg.interval} period={period}s")
-    while True:
-        await scan_once()
-        await asyncio.sleep(period)
+    try:
+        while True:
+            await scan_once()
+            await asyncio.sleep(period)
+    finally:
+        if supa:
+            await supa.close()
 
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
-        import uvloop  # type: ignore
-        uvloop.install()
+        import uvloop; uvloop.install()
     except Exception:
         pass
     asyncio.run(main_loop())
