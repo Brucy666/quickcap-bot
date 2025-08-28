@@ -19,9 +19,8 @@ from app.executor import PaperExecutor
 from app.alpha.spot_perp_engine import compute_basis_signals
 
 from app.storage.supabase import Supa
-from app.policy import POLICY
-from app.notifier import NOTIFY
-from app.alpha.allowlist import is_allowed   # <-- NEW: data-driven allowlist
+from app.policy import POLICY                  # central trade filter (cooldowns / thresholds)
+from app.notifier import NOTIFY                # Discord notifier singleton
 
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
@@ -39,6 +38,7 @@ SPOT_ADAPTERS = {
     "okx": OKXSpotPublic,
     "bybit": BybitSpotPublic,
 }
+
 PERP_VENUES = {
     "binance": (BinanceSpotPublic, BinancePerpPublic),
     "okx": (OKXSpotPublic, OKXPerpPublic),
@@ -87,7 +87,6 @@ def _mk_reason(triggers: List[str]) -> str:
     return ", ".join(triggers) if triggers else ""
 
 
-# ----------------------------- SPOT PATH ---------------------------------- #
 async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str, executor: PaperExecutor):
     df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
     if len(df) < 50 or cfg.risk_off:
@@ -98,48 +97,45 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     last["score"] = float(score_row(last))
 
     # Build triggers
-    triggers: list[str] = []
-    if last.get("sweep_long") and last.get("bull_div"):  triggers.append("VWAP Sweep Long")
-    if last.get("sweep_short") and last.get("bear_div"): triggers.append("VWAP Sweep Short")
-    if bool(last.get("mom_pop")):                        triggers.append("Momentum Pop")
+    triggers: List[str] = []
+    if last.get("sweep_long") and last.get("bull_div"):
+        triggers.append("VWAP Sweep Long")
+    if last.get("sweep_short") and last.get("bear_div"):
+        triggers.append("VWAP Sweep Short")
+    if bool(last.get("mom_pop")):
+        triggers.append("Momentum Pop")
     if not triggers:
         return
 
     side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
     price = float(last["close"])
-    vwap  = float(last["vwap"])
-    rsi   = float(last["rsi"])
+    vwap = float(last["vwap"])
+    rsi = float(last.get("rsi", 0.0))
     score = float(last["score"])
     reason = _mk_reason(triggers)
 
-    # ------------ ALLOWLIST + POLICY GATES (SPOT) -------------
-    signal_type = "spot"
-    horizon_m   = getattr(cfg, "eval_horizon_m", 30)
-
-    # 1) Allowlist (Supabase-backed; fails open if not configured)
-    if not await is_allowed(ex_name, symbol, signal_type, horizon_m):
-        return
-
-    # 2) Policy guard (thresholds / cooldowns / flip-protection)
-    dec = POLICY.should_trade({
-        "venue": ex_name,
-        "symbol": symbol,
-        "signal_type": signal_type,
-        "side": side,
-        "score": score,
-        "reason": reason,
-        "rsi": rsi,
-        "vwap": vwap,
-        "close": price,
-        "triggers": list(triggers),
-        "ts": _utc_now_iso(),
-        "interval": cfg.interval,
-    })
+    # Policy gate (centralized risk filter) — pass dict (do not unpack)
+    ctx = dict(
+        signal_type="spot",
+        venue=ex_name,
+        symbol=symbol,
+        interval=cfg.interval,
+        side=side,
+        score=score,
+        reason=reason,
+        ts=_utc_now_iso(),
+        close=price,
+        vwap=vwap,
+        rsi=rsi,
+        triggers=list(triggers),
+    )
+    dec = POLICY.should_trade(ctx)
     if not dec.take:
         return
 
-    # Optional local per-symbol cooldown (extra noise guard; policy already has cooldowns)
-    now = time.time(); key = (ex_name, symbol)
+    # Optional local per-symbol cooldown (policy also has its own)
+    now = time.time()
+    key = (ex_name, symbol)
     if now - LAST_ALERT.get(key, 0) < max(5, int(getattr(cfg, "alert_cooldown_sec", 0) or 0)):
         return
     LAST_ALERT[key] = now
@@ -162,8 +158,15 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     # Discord alert
     try:
         await NOTIFY.post_signal_embed(
-            exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
-            price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers,
+            exchange=ex_name,
+            symbol=symbol,
+            interval=cfg.interval,
+            side=side,
+            price=price,
+            vwap=vwap,
+            rsi=rsi,
+            score=score,
+            triggers=triggers,
         )
     except Exception as e:
         log.warning(f"notify post_signal_embed failed: {e}")
@@ -185,14 +188,14 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 
-# ----------------------------- BASIS PATH --------------------------------- #
 async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str, executor: PaperExecutor):
     pair = PERP_VENUES.get(venue)
     if not pair:
         return
 
     spot_cls, perp_cls = pair
-    spot = spot_cls(); perp = perp_cls()
+    spot = spot_cls()
+    perp = perp_cls()
 
     s_df = await _fetch_symbol(spot, symbol, cfg.interval, cfg.lookback)
     p_df = await _fetch_symbol(perp, symbol, cfg.interval, cfg.lookback)
@@ -203,40 +206,29 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     if not sig.get("ok") or not sig["triggers"]:
         return
 
-    side  = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
+    side = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
     score = 2.0 + min(abs(sig["basis_z"]), 5.0)
     triggers = list(sig["triggers"])
-    reason   = "Basis:" + _mk_reason(triggers)
+    reason = "Basis:" + _mk_reason(triggers)
 
-    # ------------ ALLOWLIST + POLICY GATES (BASIS) -------------
-    signal_type = "basis"
-    horizon_m   = getattr(cfg, "eval_horizon_m", 30)
-
-    price = float(sig["spot_close"])
-    vwap  = float(sig["spot_vwap"])
-    rsi   = float(sig["spot_rsi"])
-
-    # 1) Allowlist (Supabase-backed)
-    if not await is_allowed(venue, symbol, signal_type, horizon_m):
-        return
-
-    # 2) Policy
-    dec = POLICY.should_trade({
-        "venue": venue,
-        "symbol": symbol,
-        "signal_type": signal_type,
-        "side": side,
-        "score": float(score),
-        "reason": reason,
-        "rsi": rsi,
-        "vwap": vwap,
-        "close": price,
-        "triggers": triggers,
-        "ts": _utc_now_iso(),
-        "interval": cfg.interval,
-        "basis_pct": float(sig["basis_pct"]),
-        "basis_z":   float(sig["basis_z"]),
-    })
+    # Policy gate — pass dict (do not unpack)
+    ctx = dict(
+        signal_type="basis",
+        venue=venue,
+        symbol=symbol,
+        interval=cfg.interval,
+        side=side,
+        score=float(score),
+        reason=reason,
+        ts=_utc_now_iso(),
+        close=float(sig["spot_close"]),
+        vwap=float(sig["spot_vwap"]),
+        rsi=float(sig["spot_rsi"]),
+        triggers=triggers,
+        basis_pct=float(sig["basis_pct"]),
+        basis_z=float(sig["basis_z"]),
+    )
+    dec = POLICY.should_trade(ctx)
     if not dec.take:
         return
 
@@ -248,25 +240,33 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         "symbol": symbol,
         "interval": cfg.interval,
         "side": side,
-        "price": price,
-        "vwap": vwap,
-        "rsi": rsi,
+        "price": float(sig["spot_close"]),
+        "vwap": float(sig["spot_vwap"]),
+        "rsi": float(sig["spot_rsi"]),
         "score": float(score),
         "triggers": triggers,
     }
 
-    # Discord alert (with basis metrics)
+    # Discord alert (with basis fields)
     try:
         await NOTIFY.post_signal_embed(
-            exchange=f"{venue}:BASIS", symbol=symbol, interval=cfg.interval, side=side,
-            price=price, vwap=vwap, rsi=rsi, score=float(score), triggers=triggers,
-            basis_pct=float(sig["basis_pct"]), basis_z=float(sig["basis_z"]),
+            exchange=f"{venue}:BASIS",
+            symbol=symbol,
+            interval=cfg.interval,
+            side=side,
+            price=float(sig["spot_close"]),
+            vwap=float(sig["spot_vwap"]),
+            rsi=float(sig["spot_rsi"]),
+            score=float(score),
+            triggers=triggers,
+            basis_pct=float(sig["basis_pct"]),
+            basis_z=float(sig["basis_z"]),
         )
     except Exception as e:
         log.warning(f"notify post_signal_embed (basis) failed: {e}")
 
     # Paper exec
-    exec_rec = await executor.submit(symbol, side, price, float(score), reason)
+    exec_rec = await executor.submit(symbol, side, float(sig["spot_close"]), float(score), reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
         "venue": exec_rec["venue"],
@@ -281,7 +281,6 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 
-# ----------------------------- LOOPING ------------------------------------ #
 async def scan_once():
     cfg = load_settings()
     supa = _supa(cfg)
@@ -303,7 +302,7 @@ async def scan_once():
         for sym in (hotmap.get(ex_name, []) or list(cfg.symbols)):
             await _process_symbol(cfg, supa, ex_name, ex, sym, executor)
 
-    if getattr(cfg, "spot_perp_enabled", False):
+    if cfg.spot_perp_enabled:
         for venue in cfg.spot_perp_exchanges:
             for sym in (hotmap.get(venue, []) or list(cfg.symbols)):
                 await _spot_perp_for_symbol(cfg, supa, venue, sym, executor)
