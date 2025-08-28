@@ -1,16 +1,12 @@
-# app/main.py
-from __future__ import annotations
-
-# --- quiet pandas' FutureWarning noise (we still opt into no_silent_downcasting) ---
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+import os, asyncio, time
+from datetime import datetime, timezone
+from typing import Dict, Tuple, List
+
 import pandas as pd
 pd.set_option("future.no_silent_downcasting", True)
-
-import asyncio, time
-from datetime import datetime, timezone
-from typing import Dict, Tuple, List, Optional
 
 from app.config import load_settings
 from app.logger import get_logger
@@ -22,8 +18,8 @@ from app.executor import PaperExecutor
 from app.alpha.spot_perp_engine import compute_basis_signals
 
 from app.storage.supabase import Supa
-from app.policy import POLICY                  # centralized trade policy / cooldowns
-from app.notifier import NOTIFY                # Discord notifier (singleton)
+from app.policy import POLICY
+from app.notifier import NOTIFY
 
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
@@ -33,8 +29,8 @@ from app.exchanges import (
 
 log = get_logger("main")
 
-# keep a very lightweight local cooldown as an extra guard
-_LAST_ALERT: Dict[Tuple[str, str], float] = {}
+DEBUG_NOTIFY = os.getenv("DEBUG_NOTIFY", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
+LAST_ALERT: Dict[Tuple[str, str], float] = {}
 
 SPOT_ADAPTERS = {
     "kucoin": KuCoinPublic,
@@ -44,286 +40,234 @@ SPOT_ADAPTERS = {
     "bybit": BybitSpotPublic,
 }
 PERP_VENUES = {
-    "binance": (BinanceSpotPublic,  BinancePerpPublic),
-    "okx":     (OKXSpotPublic,      OKXPerpPublic),
-    "bybit":   (BybitSpotPublic,    BybitPerpPublic),
+    "binance": (BinanceSpotPublic, BinancePerpPublic),
+    "okx": (OKXSpotPublic, OKXPerpPublic),
+    "bybit": (BybitSpotPublic, BybitPerpPublic),
 }
-
-# ---------------- util ----------------
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _mk_reason(triggers: List[str]) -> str:
-    return ", ".join(t for t in triggers if str(t).strip())
+async def _dbg(msg: str):
+    if DEBUG_NOTIFY:
+        try: await NOTIFY.debug(msg)
+        except: pass
 
-def _supa(cfg) -> Optional[Supa]:
-    try:
-        if getattr(cfg, "supabase_enabled", False) and cfg.supabase_url and cfg.supabase_key:
-            return Supa(cfg.supabase_url, cfg.supabase_key)
-    except Exception as e:
-        log.warning(f"Supabase init skipped: {e}")
+def _build_spot_exchanges(enabled: List[str]):
+    return [(name, SPOT_ADAPTERS[name]()) for name in SPOT_ADAPTERS if name in enabled]
+
+def _supa(cfg):
+    if getattr(cfg, "supabase_enabled", False) and cfg.supabase_url and cfg.supabase_key:
+        return Supa(cfg.supabase_url, cfg.supabase_key)
     return None
 
-def _spot_clients(enabled: List[str]):
-    out = []
-    for name, cls in SPOT_ADAPTERS.items():
-        if name in enabled:
-            try:
-                out.append((name, cls()))
-            except Exception as e:
-                log.warning(f"init {name} failed: {e}")
-    return out
-
-async def _fetch_df(ex, symbol: str, interval: str, lookback: int) -> pd.DataFrame:
-    """Fetch klines and normalize; always returns a DataFrame."""
+async def _fetch_symbol(ex, symbol: str, interval: str, lookback: int):
     try:
         kl = await ex.fetch_klines(symbol, interval, lookback)
+        return to_dataframe(kl)
     except Exception as e:
-        log.debug(f"fetch_klines error {getattr(ex, 'name', ex)} {symbol}: {e}")
-        kl = []
-    df = to_dataframe(kl)
-    # drop obviously-bad rows
-    if "close" in df:
-        df = df[pd.to_numeric(df["close"], errors="coerce").notna()]
-    return df.reset_index(drop=True)
+        await _dbg(f"fetch_klines failed {ex.__class__.__name__} {symbol}: {e}")
+        return to_dataframe([])
 
-async def _log_to_supa(supa: Optional[Supa], signal_row: dict, exec_row: Optional[dict] = None):
-    if not supa:
-        return
+async def _log_signal_and_exec_to_supa(supa: Supa | None, signal_payload: dict, exec_payload: dict | None = None):
+    if not supa: return
     try:
-        asyncio.create_task(supa.log_signal(**signal_row))
-        if exec_row:
-            asyncio.create_task(supa.log_execution(**exec_row))
+        asyncio.create_task(supa.log_signal(**signal_payload))
+        if exec_payload:
+            asyncio.create_task(supa.log_execution(**exec_payload))
     except Exception as e:
-        log.warning(f"supa log error: {e}")
+        log.error(f"Supabase log error: {e}")
+        await _dbg(f"Supabase log error: {e}")
 
-# ---------------- spot path ----------------
+def _mk_reason(triggers: List[str]) -> str:
+    return ", ".join(triggers) if triggers else ""
 
-async def _process_symbol(cfg, supa: Optional[Supa], ex_name: str, ex, symbol: str, executor: PaperExecutor):
-    df = await _fetch_df(ex, symbol, cfg.interval, cfg.lookback)
-    if len(df) < 50 or getattr(cfg, "risk_off", False):
+async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str, executor: PaperExecutor):
+    df = await _fetch_symbol(ex, symbol, cfg.interval, cfg.lookback)
+    if len(df) < 50:
+        await _dbg(f"skip spot {ex_name}:{symbol} (len<{50})")
+        return
+    if cfg.risk_off:
+        await _dbg("risk_off=True — skipping all spot")
         return
 
     sig = compute_signals(df)
     last = sig.iloc[-1].copy()
     last["score"] = float(score_row(last))
 
-    # triggers
+    # Triggers
     triggers: List[str] = []
     if last.get("sweep_long") or last.get("bull_div"):
-        triggers.append("VWAP Sweep Long") if last.get("sweep_long") else None
+        triggers.append("Discount + RSI Reversal Risk")
     if last.get("sweep_short") or last.get("bear_div"):
-        triggers.append("VWAP Sweep Short") if last.get("sweep_short") else None
+        triggers.append("Perp Premium Blowoff")
     if bool(last.get("mom_pop")):
         triggers.append("Momentum Pop")
+
     if not triggers:
+        await _dbg(f"no-triggers spot {ex_name}:{symbol}")
         return
 
-    side  = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
-    price = float(last.get("close", df["close"].iloc[-1]))
-    vwap  = float(last.get("vwap",  df.get("vwap", df["close"]).iloc[-1]))
-    rsi   = float(last.get("rsi",  0.0))
-    score = float(last["score"])
+    side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
+    price = float(last["close"]); vwap = float(last["vwap"]); rsi = float(last["rsi"]); score = float(last["score"])
     reason = _mk_reason(triggers)
 
-    # policy gate (FIX: pass kwargs, not positional)
+    # Policy gate
     ctx = dict(
-        signal_type="spot",
-        venue=ex_name,
-        symbol=symbol,
-        interval=cfg.interval,
-        side=side,
-        score=score,
-        reason=reason,
-        ts=_utc_now_iso(),
-        close=price, vwap=vwap, rsi=rsi,
-        triggers=triggers,
+        signal_type="spot", venue=ex_name, symbol=symbol, interval=cfg.interval,
+        side=side, score=score, reason=reason, ts=_utc_now_iso(),
+        close=price, vwap=vwap, rsi=rsi, triggers=list(triggers),
     )
-    dec = POLICY.should_trade(**ctx)
+    try:
+        dec = POLICY.should_trade(**ctx)   # ← fixed to **kwargs
+    except TypeError as te:
+        await _dbg(f"POLICY.should_trade typeerror (spot) {te}")
+        raise
+
     if not dec.take:
+        await _dbg(f"policy-no spot {ex_name}:{symbol} score={score:.3f} why={dec.why}")
         return
 
-    # local extra cooldown (per-venue+symbol)
+    # extra cooldown (executor/policy already have guards; this avoids double pings)
     now = time.time(); key = (ex_name, symbol)
-    if now - _LAST_ALERT.get(key, 0.0) < max(5, int(getattr(cfg, "alert_cooldown_sec", 0) or 0)):
+    if now - LAST_ALERT.get(key, 0) < max(5, int(cfg.alert_cooldown_sec or 0)):
+        await _dbg(f"local-cooldown spot {ex_name}:{symbol}")
         return
-    _LAST_ALERT[key] = now
+    LAST_ALERT[key] = now
 
-    # signal payload
     signal_row = {
-        "ts": _utc_now_iso(),
-        "signal_type": "spot",
-        "venue": ex_name,
-        "symbol": symbol,
-        "interval": cfg.interval,
-        "side": side,
-        "price": price,
-        "vwap": vwap,
-        "rsi": rsi,
-        "score": score,
-        "triggers": triggers,
+        "ts": _utc_now_iso(), "signal_type": "spot", "venue": ex_name, "symbol": symbol,
+        "interval": cfg.interval, "side": side, "price": price, "vwap": vwap,
+        "rsi": rsi, "score": score, "triggers": triggers,
     }
 
-    # discord (live)
     try:
         await NOTIFY.signal_embed(
             exchange=ex_name, symbol=symbol, interval=cfg.interval, side=side,
             price=price, vwap=vwap, rsi=rsi, score=score, triggers=triggers,
         )
+        await _dbg(f"sent spot {ex_name}:{symbol} side={side} score={score:.3f}")
     except Exception as e:
-        log.warning(f"notify live (spot) failed: {e}")
+        log.warning(f"notify spot failed: {e}")
+        await _dbg(f"notify spot failed: {e}")
 
     # paper exec
     exec_rec = await executor.submit(symbol, side, price, score, reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
-        "venue": exec_rec["venue"],
-        "symbol": exec_rec["symbol"],
-        "side": exec_rec["side"],
-        "price": exec_rec["price"],
-        "score": exec_rec["score"],
-        "reason": exec_rec["reason"],
-        "is_paper": exec_rec["is_paper"],
+        "venue": exec_rec["venue"], "symbol": exec_rec["symbol"],
+        "side": exec_rec["side"], "price": exec_rec["price"], "score": exec_rec["score"],
+        "reason": exec_rec["reason"], "is_paper": exec_rec["is_paper"],
     }
+    await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
-    await _log_to_supa(supa, signal_row, exec_row)
-
-# ---------------- basis path ----------------
-
-async def _spot_perp_for_symbol(cfg, supa: Optional[Supa], venue: str, symbol: str, executor: PaperExecutor):
+async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str, executor: PaperExecutor):
     pair = PERP_VENUES.get(venue)
-    if not pair:
-        return
+    if not pair: return
     spot_cls, perp_cls = pair
     spot = spot_cls(); perp = perp_cls()
-
-    s_df = await _fetch_df(spot, symbol, cfg.interval, cfg.lookback)
-    p_df = await _fetch_df(perp, symbol, cfg.interval, cfg.lookback)
+    s_df = await _fetch_symbol(spot, symbol, cfg.interval, cfg.lookback)
+    p_df = await _fetch_symbol(perp, symbol, cfg.interval, cfg.lookback)
     if len(s_df) < 50 or len(p_df) < 50:
+        await _dbg(f"skip basis {venue}:{symbol} — insufficient bars")
         return
 
-    sig = compute_basis_signals(s_df, p_df, z_win=50, z_th=getattr(cfg, "spot_perp_z", 2.5))
+    sig = compute_basis_signals(s_df, p_df, z_win=50, z_th=cfg.spot_perp_z)
     if not sig.get("ok") or not sig.get("triggers"):
+        await _dbg(f"no-basis {venue}:{symbol}")
         return
 
-    side = sig.get("side") or ("SHORT" if float(sig["basis_pct"]) > 0 else "LONG")
-    score = 2.0 + min(abs(float(sig["basis_z"])), 5.0)
+    side = sig["side"] or ("SHORT" if sig["basis_pct"] > 0 else "LONG")
+    score = 2.0 + min(abs(sig["basis_z"]), 5.0)
     triggers = list(sig["triggers"])
     reason = "Basis:" + _mk_reason(triggers)
 
-    # policy (FIX: kwargs)
     ctx = dict(
-        signal_type="basis",
-        venue=venue,
-        symbol=symbol,
-        interval=cfg.interval,
-        side=side,
-        score=float(score),
-        reason=reason,
-        ts=_utc_now_iso(),
-        close=float(sig["spot_close"]),
-        vwap=float(sig["spot_vwap"]),
-        rsi=float(sig["spot_rsi"]),
-        triggers=triggers,
-        basis_pct=float(sig["basis_pct"]),
-        basis_z=float(sig["basis_z"]),
+        signal_type="basis", venue=venue, symbol=symbol, interval=cfg.interval,
+        side=side, score=float(score), reason=reason, ts=_utc_now_iso(),
+        close=float(sig["spot_close"]), vwap=float(sig["spot_vwap"]), rsi=float(sig["spot_rsi"]),
+        triggers=triggers, basis_pct=float(sig["basis_pct"]), basis_z=float(sig["basis_z"]),
     )
-    dec = POLICY.should_trade(**ctx)
+    try:
+        dec = POLICY.should_trade(**ctx)
+    except TypeError as te:
+        await _dbg(f"POLICY.should_trade typeerror (basis) {te}")
+        raise
+
     if not dec.take:
+        await _dbg(f"policy-no basis {venue}:{symbol} score={score:.3f} why={dec.why}")
         return
 
-    # signal payload
     signal_row = {
-        "ts": _utc_now_iso(),
-        "signal_type": "basis",
-        "venue": venue,
-        "symbol": symbol,
-        "interval": cfg.interval,
-        "side": side,
-        "price": float(sig["spot_close"]),
-        "vwap": float(sig["spot_vwap"]),
-        "rsi": float(sig["spot_rsi"]),
-        "score": float(score),
-        "triggers": triggers,
+        "ts": _utc_now_iso(), "signal_type": "basis", "venue": venue, "symbol": symbol,
+        "interval": cfg.interval, "side": side, "price": float(sig["spot_close"]),
+        "vwap": float(sig["spot_vwap"]), "rsi": float(sig["spot_rsi"]),
+        "score": float(score), "triggers": triggers,
     }
 
-    # discord (live + basis fields)
     try:
         await NOTIFY.signal_embed(
-            exchange=f"{venue}:BASIS",
-            symbol=symbol,
-            interval=cfg.interval,
-            side=side,
-            price=float(sig["spot_close"]),
-            vwap=float(sig["spot_vwap"]),
-            rsi=float(sig["spot_rsi"]),
-            score=float(score),
-            triggers=triggers,
-            basis_pct=float(sig["basis_pct"]),
-            basis_z=float(sig["basis_z"]),
+            exchange=f"{venue}:BASIS", symbol=symbol, interval=cfg.interval, side=side,
+            price=float(sig["spot_close"]), vwap=float(sig["spot_vwap"]),
+            rsi=float(sig["spot_rsi"]), score=float(score), triggers=triggers,
+            basis_pct=float(sig["basis_pct"]), basis_z=float(sig["basis_z"]),
         )
+        await _dbg(f"sent basis {venue}:{symbol} side={side} score={score:.3f}")
     except Exception as e:
-        log.warning(f"notify live (basis) failed: {e}")
+        log.warning(f"notify basis failed: {e}")
+        await _dbg(f"notify basis failed: {e}")
 
-    # paper exec
     exec_rec = await executor.submit(symbol, side, float(sig["spot_close"]), float(score), reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
-        "venue": exec_rec["venue"],
-        "symbol": exec_rec["symbol"],
-        "side": exec_rec["side"],
-        "price": exec_rec["price"],
-        "score": exec_rec["score"],
-        "reason": exec_rec["reason"],
-        "is_paper": exec_rec["is_paper"],
+        "venue": exec_rec["venue"], "symbol": exec_rec["symbol"],
+        "side": exec_rec["side"], "price": exec_rec["price"], "score": exec_rec["score"],
+        "reason": exec_rec["reason"], "is_paper": exec_rec["is_paper"],
     }
-
-    await _log_to_supa(supa, signal_row, exec_row)
-
-# ---------------- orchestration ----------------
+    await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 async def scan_once():
     cfg = load_settings()
     supa = _supa(cfg)
-    executor = PaperExecutor(getattr(cfg, "max_pos_usdt", 0))
+    executor = PaperExecutor(cfg.max_pos_usdt)
 
-    # hotlist (or static symbols)
-    if getattr(cfg, "hotlist_enabled", False):
+    if cfg.hotlist_enabled:
         hotmap = await build_hotmap(
-            cfg.exchanges,
-            top_n=getattr(cfg, "hotlist_top_n", 20),
-            min_vol_usdt=getattr(cfg, "hotlist_min_vol_usdt", 1_000_000),
-            force_symbols=getattr(cfg, "force_symbols", []),
-            exclude_symbols=getattr(cfg, "exclude_symbols", []),
+            cfg.exchanges, cfg.hotlist_top_n, cfg.hotlist_min_vol_usdt,
+            cfg.force_symbols, cfg.exclude_symbols,
         )
-        log.info("Hotlist per-venue: { " + ", ".join(f"{k}:{len(v)}" for k, v in hotmap.items()) + " }")
+        await _dbg("hotlist built: " + ", ".join(f"{k}:{len(v)}" for k, v in hotmap.items()))
     else:
-        hotmap = {ex: list(getattr(cfg, "symbols", [])) for ex in cfg.exchanges}
+        hotmap = {ex: list(cfg.symbols) for ex in cfg.exchanges}
 
-    # SPOT
-    for ex_name, ex in _spot_clients(cfg.exchanges):
-        for sym in (hotmap.get(ex_name, []) or list(getattr(cfg, "symbols", []))):
+    for ex_name, ex in _build_spot_exchanges(cfg.exchanges):
+        for sym in (hotmap.get(ex_name, []) or list(cfg.symbols)):
             await _process_symbol(cfg, supa, ex_name, ex, sym, executor)
 
-    # BASIS
-    if getattr(cfg, "spot_perp_enabled", False):
-        for venue in getattr(cfg, "spot_perp_exchanges", []):
-            for sym in (hotmap.get(venue, []) or list(getattr(cfg, "symbols", []))):
+    if cfg.spot_perp_enabled:
+        for venue in cfg.spot_perp_exchanges:
+            for sym in (hotmap.get(venue, []) or list(cfg.symbols)):
                 await _spot_perp_for_symbol(cfg, supa, venue, sym, executor)
+
+    await _dbg("heartbeat: scan_once complete")
 
 async def main_loop():
     cfg = load_settings()
-    period = max(10, int(getattr(cfg, "scan_period_sec", 60)))
+    period = max(10, int(cfg.scan_period_sec))
     log.info(f"Starting scan loop | exchanges={cfg.exchanges} interval={cfg.interval} period={period}s")
+    await _dbg("main loop started")
     while True:
-        await scan_once()
+        try:
+            await scan_once()
+        except Exception as e:
+            log.exception("scan_once crashed")
+            try: await NOTIFY.error(f"loop crash: {e}")
+            except: pass
         await asyncio.sleep(period)
 
 if __name__ == "__main__":
     try:
-        import uvloop  # type: ignore
-        uvloop.install()
+        import uvloop; uvloop.install()
     except Exception:
         pass
     asyncio.run(main_loop())
