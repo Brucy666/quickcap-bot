@@ -5,7 +5,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import pandas as pd
 pd.set_option("future.no_silent_downcasting", True)
 
-import asyncio, time
+import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Dict, Tuple, List
 
@@ -19,8 +20,8 @@ from app.executor import PaperExecutor
 from app.alpha.spot_perp_engine import compute_basis_signals
 
 from app.storage.supabase import Supa
-from app.policy import POLICY                  # central trade filter (cooldowns / thresholds)
-from app.notifier import NOTIFY                # Discord notifier singleton
+from app.policy import POLICY                 # centralized trade policy
+from app.notifier import NOTIFY               # Discord notifier singleton
 
 from app.exchanges import (
     KuCoinPublic, MEXCPublic,
@@ -38,7 +39,6 @@ SPOT_ADAPTERS = {
     "okx": OKXSpotPublic,
     "bybit": BybitSpotPublic,
 }
-
 PERP_VENUES = {
     "binance": (BinanceSpotPublic, BinancePerpPublic),
     "okx": (OKXSpotPublic, OKXPerpPublic),
@@ -96,8 +96,8 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     last = sig.iloc[-1].copy()
     last["score"] = float(score_row(last))
 
-    # Build triggers
-    triggers: List[str] = []
+    # Triggers
+    triggers: list[str] = []
     if last.get("sweep_long") and last.get("bull_div"):
         triggers.append("VWAP Sweep Long")
     if last.get("sweep_short") and last.get("bear_div"):
@@ -110,11 +110,11 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     side = "LONG" if (last.get("sweep_long") or last.get("bull_div")) else "SHORT"
     price = float(last["close"])
     vwap = float(last["vwap"])
-    rsi = float(last.get("rsi", 0.0))
+    rsi = float(last["rsi"])
     score = float(last["score"])
     reason = _mk_reason(triggers)
 
-    # Policy gate (centralized risk filter) — pass dict (do not unpack)
+    # ---- POLICY GATE (kwargs!)
     ctx = dict(
         signal_type="spot",
         venue=ex_name,
@@ -129,11 +129,11 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         rsi=rsi,
         triggers=list(triggers),
     )
-    dec = POLICY.should_trade(ctx)
+    dec = POLICY.should_trade(**ctx)  # <-- FIX: unpack dict as kwargs
     if not dec.take:
         return
 
-    # Optional local per-symbol cooldown (policy also has its own)
+    # Optional per-symbol throttle (policy already enforces cooldowns by bucket)
     now = time.time()
     key = (ex_name, symbol)
     if now - LAST_ALERT.get(key, 0) < max(5, int(getattr(cfg, "alert_cooldown_sec", 0) or 0)):
@@ -155,7 +155,7 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         "triggers": triggers,
     }
 
-    # Discord alert
+    # Discord notify (best-effort)
     try:
         await NOTIFY.post_signal_embed(
             exchange=ex_name,
@@ -171,7 +171,7 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
     except Exception as e:
         log.warning(f"notify post_signal_embed failed: {e}")
 
-    # Paper execution + payload
+    # Paper execution + log
     exec_rec = await executor.submit(symbol, side, price, score, reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
@@ -183,8 +183,6 @@ async def _process_symbol(cfg, supa: Supa | None, ex_name: str, ex, symbol: str,
         "reason": exec_rec["reason"],
         "is_paper": exec_rec["is_paper"],
     }
-
-    # Non-blocking Supabase writes
     await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 
@@ -192,11 +190,9 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     pair = PERP_VENUES.get(venue)
     if not pair:
         return
-
     spot_cls, perp_cls = pair
     spot = spot_cls()
     perp = perp_cls()
-
     s_df = await _fetch_symbol(spot, symbol, cfg.interval, cfg.lookback)
     p_df = await _fetch_symbol(perp, symbol, cfg.interval, cfg.lookback)
     if len(s_df) < 50 or len(p_df) < 50:
@@ -211,7 +207,7 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     triggers = list(sig["triggers"])
     reason = "Basis:" + _mk_reason(triggers)
 
-    # Policy gate — pass dict (do not unpack)
+    # ---- POLICY GATE (kwargs!)
     ctx = dict(
         signal_type="basis",
         venue=venue,
@@ -228,11 +224,11 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         basis_pct=float(sig["basis_pct"]),
         basis_z=float(sig["basis_z"]),
     )
-    dec = POLICY.should_trade(ctx)
+    dec = POLICY.should_trade(**ctx)  # <-- FIX: unpack dict as kwargs
     if not dec.take:
         return
 
-    # Build signal payload
+    # Build & notify
     signal_row = {
         "ts": _utc_now_iso(),
         "signal_type": "basis",
@@ -247,7 +243,6 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         "triggers": triggers,
     }
 
-    # Discord alert (with basis fields)
     try:
         await NOTIFY.post_signal_embed(
             exchange=f"{venue}:BASIS",
@@ -265,7 +260,6 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
     except Exception as e:
         log.warning(f"notify post_signal_embed (basis) failed: {e}")
 
-    # Paper exec
     exec_rec = await executor.submit(symbol, side, float(sig["spot_close"]), float(score), reason)
     exec_row = {
         "ts": datetime.fromtimestamp(exec_rec["ts"], tz=timezone.utc).isoformat(),
@@ -277,7 +271,6 @@ async def _spot_perp_for_symbol(cfg, supa: Supa | None, venue: str, symbol: str,
         "reason": exec_rec["reason"],
         "is_paper": exec_rec["is_paper"],
     }
-
     await _log_signal_and_exec_to_supa(supa, signal_row, exec_row)
 
 
